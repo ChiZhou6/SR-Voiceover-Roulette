@@ -6,12 +6,14 @@
   _shot_size_70.png / _shot_size_100.png / _shot_size_140.png   实时轮盘（带外圈）
   _shot_size_preview.png                    设置页里的预览（120%）
   _shot_pause_toast.png                     暂停提示（40% 不透明度）
+（都写在 _tests/ 下，已被 .gitignore 忽略）
 """
 import os
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+OUT = Path(__file__).resolve().parent   # 截图落在 _tests/ 下，别污染仓库根目录
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -91,7 +93,7 @@ def render_realtime(scale: float) -> None:
     p.drawText(QRectF(0, size - 22, size, 18), Qt.AlignCenter,
                f"整体大小 {int(scale * 100)}%   窗口 {size}px")
     p.end()
-    out = ROOT / f"_shot_size_{int(scale * 100)}.png"
+    out = OUT / f"_shot_size_{int(scale * 100)}.png"
     canvas.save(str(out))
     print("已生成", out.name)
     w.hide()
@@ -120,7 +122,7 @@ def render_preview() -> None:
     p.setPen(QPen(QColor(210, 216, 224, 200)))
     p.drawText(QRectF(0, side - 22, side, 18), Qt.AlignCenter, "设置页预览 120%")
     p.end()
-    out = ROOT / "_shot_size_preview.png"
+    out = OUT / "_shot_size_preview.png"
     canvas.save(str(out))
     print("已生成", out.name)
     w.hide()
@@ -150,7 +152,7 @@ def render_toast() -> None:
     p.setPen(QPen(QColor(220, 150, 150, 220)))
     p.drawText(QRectF(6, int(H * 0.5) + 4, 200, 16), Qt.AlignLeft, "屏幕正中（红线）")
     p.end()
-    out = ROOT / "_shot_pause_toast.png"
+    out = OUT / "_shot_pause_toast.png"
     canvas.save(str(out))
     print("已生成", out.name)
     t.hide()
