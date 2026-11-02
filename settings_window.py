@@ -2711,7 +2711,7 @@ class WheelPage(QWidget):
             "整个轮盘等比放大/缩小：内圈、外圈厚度、扇区上的文字、中心提示\n"
             "会一起变，选中判定的范围也跟着变，不会出现「看着大、选着小」。\n"
             "100% 是标准大小；屏幕小就用小一点，4K 屏看不清可以调大。\n"
-            "右边那个预览是固定大小的，不跟着这一项涨缩，以游戏内的实际效果为准。"
+            "右边那个预览不跟着这一项涨缩（它按 100% 画），实际大小以游戏内为准。"
         )
         lay.addWidget(_row("整体大小", self.scale, "内外圈和文字一起缩放"))
         self.opacity = self._slider(int(float(cfg.get("opacity", 0.94)) * 100), 40, 100, " %")
@@ -3882,6 +3882,22 @@ def _drag_pixmap(text: str, width: int = 150, height: int = 38) -> QPixmap:
     return pm
 
 
+def preview_radius_of(cfg: dict) -> int:
+    """预览用的轮盘半径：跟「直径」等比，但夹在 150~235 之间。
+
+    180（默认直径）对应 190，比老版本那个 172 大约 10%——用户反馈预览
+    "看着比以前小一圈"，实际上是无处安放的留白太多，整体放大一点点就正常了。
+    直径调大时预览框跟着长，否则把轮盘调到 215、预览还停在老尺寸会更显小。
+    上限 210 是为了别把预览卡片撑破：最小窗口（980×750）下卡片高度只有 476，
+    预览控件 210×2+48=468 刚好塞得下。
+    """
+    try:
+        r = int(round(float(cfg.get("wheel_radius", 180)) * 190.0 / 180.0))
+    except (TypeError, ValueError):
+        r = 190
+    return max(150, min(210, r))
+
+
 class WheelPreview(sr.WheelWidget):
     """配置窗口里的轮盘：能接收拖放，也能把扇区拖出去。
 
@@ -4567,7 +4583,9 @@ class SettingsWindow(QWidget):
         wh.addLayout(cap)
 
         self.preview_cfg = dict(cfg)
-        self.preview_cfg["wheel_radius"] = 172
+        # 预览框大小跟着「直径」走（180 对应 172 基准，和以前一样），
+        # 之前固定写死 172，导致直径调到 215 了预览还是老尺寸，看着偏小
+        self.preview_cfg["wheel_radius"] = preview_radius_of(cfg)
         self.preview = WheelPreview(self.preview_cfg, bank)
         side = int(self.preview_cfg["wheel_radius"] * 2 + 48)
         self.preview.setFixedSize(side, side)
@@ -4803,8 +4821,7 @@ class SettingsWindow(QWidget):
         # 拖那个滑块时只有游戏里的轮盘会变，预览保持稳定不跟着涨缩
         self.preview_cfg["wheel_scale"] = 1.0
         # 预览半径按比例缩放，跟着真实半径走但始终放得下
-        r = int(float(cfg["wheel_radius"]) * 172.0 / 180.0)
-        r = max(90, min(200, r))
+        r = preview_radius_of(cfg)
         if r != int(self.preview_cfg["wheel_radius"]):
             self.preview_cfg["wheel_radius"] = r
             side = int(r * 2 + 48)
