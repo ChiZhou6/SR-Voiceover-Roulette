@@ -4569,14 +4569,17 @@ class SettingsWindow(QWidget):
         self.preview_cfg["wheel_radius"] = 172
         self.preview = WheelPreview(self.preview_cfg, bank)
         side = int(self.preview_cfg["wheel_radius"] * 2 + 48)
-        self.preview.setFixedSize(side, side)
+        # 撑满整张卡片，窗口拉大预览也跟着变大；392 只是最小尺寸，
+        # 保证窄窗口下不至于把轮盘压成一团
+        self.preview.setMinimumSize(side, side)
+        self.preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.preview.bank = bank
         self.preview.selected = 0 if len(bank) else None
         self.preview.accent_rgb = (scfg.wheel_color() or None) if scfg is not None else None
         self.preview.lib_dropped.connect(self._on_lib_dropped)
         self.preview.slot_dropped.connect(self._on_slot_dropped)
         self.preview.slot_clicked.connect(self._on_slot_clicked)
-        wh.addWidget(self.preview, 1, Qt.AlignCenter)
+        wh.addWidget(self.preview, 1)
         rl.addWidget(wheel_holder, 1)
 
         self.page_wheel.changed.connect(self._on_wheel_changed)
@@ -4798,16 +4801,13 @@ class SettingsWindow(QWidget):
         self.preview_cfg["opacity"] = cfg["opacity"]
         self.preview_cfg["outer_thickness"] = cfg["outer_thickness"]
         self.preview_cfg["show_names"] = cfg["show_names"]
-        # 「整体大小」原样传下去：预览的 view_scale() 里留了 26% 余量，
+        # 「整体大小」原样传下去：预览的 view_scale() 里给 140% 留了余量，
         # 70%~140% 都能在预览框里真的变大变小，而不是被自适应压回去
         self.preview_cfg["wheel_scale"] = float(cfg.get("wheel_scale", 1.0) or 1.0)
-        # 预览半径按比例缩放，跟着真实半径走但始终放得下
+        # 预览半径按比例缩放，跟着真实半径走；控件本身是撑满卡片的，不用改尺寸
         r = int(float(cfg["wheel_radius"]) * 172.0 / 180.0)
         r = max(90, min(200, r))
-        if r != int(self.preview_cfg["wheel_radius"]):
-            self.preview_cfg["wheel_radius"] = r
-            side = int(r * 2 + 48)
-            self.preview.setFixedSize(side, side)
+        self.preview_cfg["wheel_radius"] = r
         self.preview.update()
         sr.save_config(cfg)
 
