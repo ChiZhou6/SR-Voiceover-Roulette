@@ -385,11 +385,6 @@ def wheel_scale_of(cfg: dict) -> float:
     return max(0.5, min(2.0, v))
 
 
-# 设置窗口的预览最多要装得下「整体大小」拉到 140%，所以 100% 的时候
-# 只占预览框的 1/1.4 ≈ 71%，剩下的余量留给滑块往右拖时变大。
-PREVIEW_SCALE_MAX = 1.4
-
-
 def ring_layout(cfg: dict, count: int, scale: float = 1.0) -> dict:
     """算出轮盘每一层的半径范围与格数。
 
@@ -3315,7 +3310,14 @@ class WheelWidget(QWidget):
         return wheel_scale_of(self.cfg)
 
     def paint_scale(self) -> float:
-        """这一帧轮盘所有像素尺寸的总缩放：预览适配 × 用户整体大小。"""
+        """这一帧轮盘所有像素尺寸的总缩放。
+
+        游戏里是「整体大小」那一项；设置窗口的预览不跟它走——
+        预览只负责把样子看清楚，用户拖「整体大小」时它不该跟着涨缩，
+        否则要么把轮盘挤小、要么为了留余量而永远画得偏小。
+        """
+        if getattr(self, "embedded", False):
+            return self.view_scale()
         return self.view_scale() * self.user_scale()
 
     def view_scale(self) -> float:
@@ -3323,20 +3325,15 @@ class WheelWidget(QWidget):
 
         外圈一出现轮盘就变大（内圈尺寸不动），预览区放不下，
         所以按比例缩；游戏里的轮盘永远 1.0，所见即所得。
-
-        预览框有多大就用多大（不设 1.0 上限）：100% 时占满框的
-        1/PREVIEW_SCALE_MAX，刚好给「整体大小」留出拖到 140% 的余量。
-        以前这里既乘 0.74 又夹了 min(1.0, …)，框做大也没用，轮盘永远
-        只有小小一圈。
         """
         if not getattr(self, "embedded", False):
             return 1.0
         count = len(self.bank) if self.bank is not None else 0
         extent = ring_layout(self.cfg, count, 1.0)["extent"]
-        room = min(self.width(), self.height()) / 2.0 - 6.0
+        room = min(self.width(), self.height()) / 2.0 - 14.0
         if extent <= 0 or room <= 0:
             return 1.0
-        return room / (extent * PREVIEW_SCALE_MAX)
+        return min(1.0, room / extent)
 
     def slot_pairs(self, geo: dict) -> list[tuple[int, int]]:
         """[(槽位号, 音效下标)]，按槽位号升序。外圈空着的位置不在里面。

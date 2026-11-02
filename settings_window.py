@@ -2710,7 +2710,8 @@ class WheelPage(QWidget):
         self.scale.setToolTip(
             "整个轮盘等比放大/缩小：内圈、外圈厚度、扇区上的文字、中心提示\n"
             "会一起变，选中判定的范围也跟着变，不会出现「看着大、选着小」。\n"
-            "100% 是标准大小；屏幕小就用小一点，4K 屏看不清可以调大。"
+            "100% 是标准大小；屏幕小就用小一点，4K 屏看不清可以调大。\n"
+            "右边那个预览是固定大小的，不跟着这一项涨缩，以游戏内的实际效果为准。"
         )
         lay.addWidget(_row("整体大小", self.scale, "内外圈和文字一起缩放"))
         self.opacity = self._slider(int(float(cfg.get("opacity", 0.94)) * 100), 40, 100, " %")
@@ -3927,10 +3928,10 @@ class WheelPreview(sr.WheelWidget):
         return ""
 
     def ring_geometry(self) -> tuple[dict, float]:
-        """当前预览的环布局 + 缩放比（预览适配 × 「整体大小」）。
+        """当前预览的环布局 + 缩放比（只是预览框的适配比例）。
 
-        必须和 _paint_body 用同一个系数：以前这里只取 view_scale()，
-        绘制那边却把「整体大小」也乘了进去，预览里的点选/拖放就会整体偏一圈。
+        必须和 _paint_body 用同一个系数（paint_scale），否则预览里的
+        点选/拖放会整体偏一圈。预览固定按 100% 画，不吃「整体大小」。
         """
         scale = self.paint_scale()
         return sr.ring_layout(self.cfg, self.count(), scale), scale
@@ -4569,17 +4570,14 @@ class SettingsWindow(QWidget):
         self.preview_cfg["wheel_radius"] = 172
         self.preview = WheelPreview(self.preview_cfg, bank)
         side = int(self.preview_cfg["wheel_radius"] * 2 + 48)
-        # 撑满整张卡片，窗口拉大预览也跟着变大；392 只是最小尺寸，
-        # 保证窄窗口下不至于把轮盘压成一团
-        self.preview.setMinimumSize(side, side)
-        self.preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.preview.setFixedSize(side, side)
         self.preview.bank = bank
         self.preview.selected = 0 if len(bank) else None
         self.preview.accent_rgb = (scfg.wheel_color() or None) if scfg is not None else None
         self.preview.lib_dropped.connect(self._on_lib_dropped)
         self.preview.slot_dropped.connect(self._on_slot_dropped)
         self.preview.slot_clicked.connect(self._on_slot_clicked)
-        wh.addWidget(self.preview, 1)
+        wh.addWidget(self.preview, 1, Qt.AlignCenter)
         rl.addWidget(wheel_holder, 1)
 
         self.page_wheel.changed.connect(self._on_wheel_changed)
@@ -4801,13 +4799,16 @@ class SettingsWindow(QWidget):
         self.preview_cfg["opacity"] = cfg["opacity"]
         self.preview_cfg["outer_thickness"] = cfg["outer_thickness"]
         self.preview_cfg["show_names"] = cfg["show_names"]
-        # 「整体大小」原样传下去：预览的 view_scale() 里给 140% 留了余量，
-        # 70%~140% 都能在预览框里真的变大变小，而不是被自适应压回去
-        self.preview_cfg["wheel_scale"] = float(cfg.get("wheel_scale", 1.0) or 1.0)
-        # 预览半径按比例缩放，跟着真实半径走；控件本身是撑满卡片的，不用改尺寸
+        # 「整体大小」不传给预览：预览固定按 100% 的样子画，
+        # 拖那个滑块时只有游戏里的轮盘会变，预览保持稳定不跟着涨缩
+        self.preview_cfg["wheel_scale"] = 1.0
+        # 预览半径按比例缩放，跟着真实半径走但始终放得下
         r = int(float(cfg["wheel_radius"]) * 172.0 / 180.0)
         r = max(90, min(200, r))
-        self.preview_cfg["wheel_radius"] = r
+        if r != int(self.preview_cfg["wheel_radius"]):
+            self.preview_cfg["wheel_radius"] = r
+            side = int(r * 2 + 48)
+            self.preview.setFixedSize(side, side)
         self.preview.update()
         sr.save_config(cfg)
 
