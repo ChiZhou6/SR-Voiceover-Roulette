@@ -36,6 +36,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtMultimedia import QMediaDevices
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QColorDialog,
     QComboBox,
@@ -517,13 +518,37 @@ _KEY_LABEL = {
     "enter": "回车",
     "esc": "Esc",
     "capslock": "Caps",
+    "ctrl": "Ctrl",
+    "shift": "Shift",
+    "alt": "Alt",
+    "win": "Win",
 }
 
 
 def key_label(name: str) -> str:
-    if not name:
+    """绑定名 -> 框里显示的短名，支持组合键。
+
+    组合键不写空格（"Ctrl+Shift+Y" 而不是 "Ctrl + Shift + Y"）：
+    按键框宽度有限，带空格会被截成 "Ctrl + Shif…"，反而看不清绑的是什么。
+    """
+    parts = sr.spec_parts(name)
+    if not parts:
         return ""
-    return _KEY_LABEL.get(name, name.upper())
+    return "+".join(_KEY_LABEL.get(p, p.upper()) for p in parts)
+
+
+def _mods_prefix(mods) -> str:
+    """Qt 修饰键状态 -> "ctrl+alt+shift+win" 的前半段（保持固定顺序）。"""
+    parts = []
+    if mods & Qt.ControlModifier:
+        parts.append("ctrl")
+    if mods & Qt.AltModifier:
+        parts.append("alt")
+    if mods & Qt.ShiftModifier:
+        parts.append("shift")
+    if mods & Qt.MetaModifier:
+        parts.append("win")
+    return "+".join(parts)
 
 
 def key_name_of(ev) -> str:
@@ -563,13 +588,14 @@ class _KeyEdit(QLineEdit):
     # ---- 取值/显示 ----
     def set_key(self, name: str) -> None:
         """外部设置绑定（不会回头触发 key_changed，避免回环）。"""
-        self.key_name = (name or "").strip().lower()
+        self.key_name = sr.norm_spec(name)
         self.setText(key_label(self.key_name))
         self.setToolTip(self._tip())
 
     def _tip(self) -> str:
         return (
             "点一下，然后按键盘键或鼠标键；右侧 ✕ 或 Delete 取消绑定\n"
+            "要绑组合键就这样：按住 Ctrl / Shift / Alt，再按主键\n"
             "（要绑鼠标左键请双击这个框，单击左键只是选中框）"
         )
 
@@ -583,10 +609,12 @@ class _KeyEdit(QLineEdit):
             return
         name = key_name_of(ev)
         if name:
-            self._apply(name)
+            prefix = _mods_prefix(ev.modifiers())
+            self._apply(f"{prefix}+{name}" if prefix else name)
 
     def mousePressEvent(self, ev) -> None:  # noqa: N802
-        if ev.button() == Qt.LeftButton:
+        prefix = _mods_prefix(ev.modifiers())
+        if ev.button() == Qt.LeftButton and not prefix:
             # 单击左键只用来聚焦，不然每次点框都会把自己绑成左键
             self.setFocus(Qt.MouseFocusReason)
             ev.accept()
@@ -595,22 +623,23 @@ class _KeyEdit(QLineEdit):
         if name is None:
             super().mousePressEvent(ev)
             return
-        self._apply(name)
+        self._apply(f"{prefix}+{name}" if prefix else name)
         ev.accept()
 
     def mouseDoubleClickEvent(self, ev) -> None:  # noqa: N802
+        prefix = _mods_prefix(ev.modifiers())
         if ev.button() == Qt.LeftButton:
             self.setFocus(Qt.MouseFocusReason)
-            self._apply("mouse_left")
+            self._apply(f"{prefix}+mouse_left" if prefix else "mouse_left")
             ev.accept()
             return
         super().mouseDoubleClickEvent(ev)
 
     def _apply(self, name: str) -> None:
-        self.key_name = name
-        self.setText(key_label(name))
+        self.key_name = sr.norm_spec(name)
+        self.setText(key_label(self.key_name))
         self.setToolTip(self._tip())
-        self.key_changed.emit(name)
+        self.key_changed.emit(self.key_name)
 
     def focusInEvent(self, ev) -> None:  # noqa: N802
         super().focusInEvent(ev)
@@ -1456,6 +1485,17 @@ class ComboEditorDialog(QDialog):
         for k, name in enumerate(self._sound_names()):
             self.lst_sounds.item(k).setData(Qt.UserRole, name)
         self.lst_sounds.itemDoubleClicked.connect(self._add_sound)
+
+        self.ed_find = QLineEdit()
+        self.ed_find.setPlaceholderText("搜索音效…")
+        self.ed_find.setClearButtonEnabled(True)
+        self.ed_find.setToolTip(
+            "打几个字就把列表筛出来，并自动滚到第一个匹配的位置。\n"
+            "回车直接把当前选中的音效加进组合，清空就恢复全部。"
+        )
+        self.ed_find.textChanged.connect(self._filter_sounds)
+        self.ed_find.returnPressed.connect(self._add_current_sound)
+        left.addWidget(self.ed_find)
         left.addWidget(self.lst_sounds, 1)
         tip = QLabel("同一个音效可以重复加入")
         tip.setObjectName("Hint")
@@ -1715,6 +1755,36 @@ class ComboEditorDialog(QDialog):
     def _sound_names(self) -> list[str]:
         """音效库里的全部音效（配置键：相对路径，子文件夹算在内）。"""
         return [key for key, _p in sr.scan_sound_files()]
+
+    # ---- 音效搜索 ----
+    def _filter_sounds(self, text: str) -> None:
+        """边打边筛：只留匹配项，并把滚动条直接带到第一个命中上。
+
+        左侧列表宽度固定，音效一多就得翻好几屏才能找到目标。
+        所以搜索框不只是"过滤"，还要把视线直接送到第一个匹配的位置，
+        否则筛完还得自己往下翻，问题只解决了一半。
+        """
+        kw = (text or "").strip().lower()
+        first = None
+        for i in range(self.lst_sounds.count()):
+            it = self.lst_sounds.item(i)
+            hit = (not kw) or (kw in it.text().lower())
+            it.setHidden(not hit)
+            if hit and first is None:
+                first = it
+        self.lst_sounds.clearSelection()
+        if first is None:
+            return
+        self.lst_sounds.setCurrentItem(first)
+        self.lst_sounds.scrollToItem(first, QAbstractItemView.PositionAtCenter)
+
+    def _add_current_sound(self) -> None:
+        """搜索框里按回车 = 把当前选中的音效加进组合。"""
+        it = self.lst_sounds.currentItem()
+        if it is None or it.isHidden():
+            return
+        self._add_sound(it)
+
 
     def _member_duration(self, it) -> float:
         """这一项处理后的时长（秒）：裁剪后长度 ÷（这项速度 × 整体速度）。
@@ -2097,7 +2167,7 @@ class ComboEditorDialog(QDialog):
     def _push_hotkey(self, key: str) -> None:
         if self._loading:
             return
-        self.scfg.combo_setting(self.cdef.cid).hotkey = (key or "").strip().lower()
+        self.scfg.combo_setting(self.cdef.cid).hotkey = sr.norm_spec(key)
         self._check_hotkey_conflict()
         self._commit()
 
@@ -2107,22 +2177,23 @@ class ComboEditorDialog(QDialog):
         自己的键不可能被别人抢走 —— 绑定表是按"先到先得"建的，
         呼出轮盘用的键优先级最高，所以这里必须显式告诉用户。
         """
-        key = (self.key_combo.key_name or "").strip().lower()
+        key = sr.norm_spec(self.key_combo.key_name)
         if not key:
             self.key_combo.clear_conflict()
             return
-        wheel_key = str((self.cfg or {}).get("hotkey", "")).strip().lower()
+        wheel_key = sr.norm_spec((self.cfg or {}).get("hotkey", ""))
         if wheel_key and key == wheel_key:
-            self.key_combo.mark_conflict(f"{key.upper()} 是呼出轮盘的键，这个组合按不出来")
+            self.key_combo.mark_conflict(
+                f"{key_label(key)} 是呼出轮盘的键，这个组合按不出来")
             return
         mine = self.scfg.combo_key(self.cdef.cid)
         for name in self.scfg.order:
             if name == mine:
                 continue
-            hk = self.scfg.setting(name).hotkey
+            hk = sr.norm_spec(self.scfg.setting(name).hotkey)
             if hk and hk == key:
                 self.key_combo.mark_conflict(
-                    f"{key.upper()} 已经被「{self.scfg.display_name(name)}」占用"
+                    f"{key_label(key)} 已经被「{self.scfg.display_name(name)}」占用"
                 )
                 return
         self.key_combo.clear_conflict()
@@ -2425,6 +2496,7 @@ class HotkeyPage(QWidget):
         tip = QLabel(
             "所有按键框都能绑鼠标：点进框里按右键 / 中键 / 侧键即可；"
             "要绑鼠标左键请双击框；点框右侧的 ✕ 取消绑定。\n"
+            "想绑组合键：按住 Ctrl / Shift / Alt 再按主键，框里会显示成「Ctrl+Shift+Y」。\n"
             "呼出轮盘的框不能空着：清掉会自动退回上一个可用键。"
         )
         tip.setObjectName("Hint")
@@ -2531,7 +2603,9 @@ class HotkeyPage(QWidget):
                 owners.setdefault(k, []).append(label)
         if self.scfg is not None:
             for name, hk in (self.scfg.hotkey_map() or {}).items():
-                owners.setdefault(hk, []).append(f"音效「{Path(name).stem}」")
+                hk = sr.norm_spec(hk)
+                if hk:
+                    owners.setdefault(hk, []).append(f"音效「{Path(name).stem}」")
 
         for label, box in self._bindings():
             k = box.key_name
@@ -2643,6 +2717,14 @@ class WheelPage(QWidget):
         self.chk_names.setChecked(bool(cfg.get("show_names", True)))
         lay.addWidget(self.chk_names)
 
+        self.chk_anim = QCheckBox("开启动画")
+        self.chk_anim.setChecked(bool(cfg.get("animations", True)))
+        self.chk_anim.setToolTip(
+            "轮盘弹出时的展开、释放音效时的收起、暂停/恢复的提示，都走这一个开关。\n"
+            "关掉之后全部变成瞬间出现、瞬间消失——晕动或者嫌动画挡视线就关掉。"
+        )
+        lay.addWidget(self.chk_anim)
+
         root.addWidget(card)
 
         # ---------------- 配色：主题色（界面）+ 轮盘色（每套各自一个） ----------------
@@ -2746,6 +2828,7 @@ class WheelPage(QWidget):
                   self.sensitivity, self.deadzone, self.noise):
             w.slider.valueChanged.connect(self._push)
         self.chk_names.toggled.connect(self._push)
+        self.chk_anim.toggled.connect(self._push)
 
         self.refresh_wheels()
         self._refresh_color_dots()
@@ -2978,6 +3061,7 @@ class WheelPage(QWidget):
         self.cfg["opacity"] = self.opacity.slider.value() / 100.0
         self.cfg["outer_thickness"] = int(self.outer_thick.slider.value())
         self.cfg["show_names"] = bool(self.chk_names.isChecked())
+        self.cfg["animations"] = bool(self.chk_anim.isChecked())
         self.cfg["sensitivity"] = self.sensitivity.slider.value() / 100.0
         self.cfg["deadzone_px"] = int(self.deadzone.slider.value())
         self.cfg["noise_floor"] = int(self.noise.slider.value())
@@ -3504,7 +3588,8 @@ class HelpPage(QWidget):
             (
                 "4｜实战怎么按",
                 "长按 Y（默认 0.25 秒）→ 轮盘出现 → 鼠标划方向 → 松开就播。\n"
-                "圆点在正中松手：正在响就停掉，没响就什么也不做。\n"
+                "圆点在正中松手：正在响就停掉，同时软件进入暂停（所有快捷键暂时失效）。"
+                "解除有两条路：再按住热键、在中心松手一次；或者直接在轮盘上选个音效，播完顺手就恢复了。\n"
                 "轮盘弹着时点鼠标左键 / 右键：立刻收起，什么都不播，这一按也不会再弹。\n"
                 "单击 Y：直接重播上一个，不开轮盘。",
             ),
@@ -3539,6 +3624,8 @@ class HelpPage(QWidget):
                 "8｜组合音效",
                 "「音效库」页最底部 →「＋ 新建组合」→ 左边双击加入（同一音效可以重复加）→ "
                 "每一行设触发条件、延迟、音量、变调、速度 → 拖上轮盘，或者给它绑个专属热键。\n"
+                "音效多到要翻半天？左边列表上方有搜索框，打几个字就筛出匹配项并自动滚到第一个，"
+                "按回车直接加进组合。\n"
                 "两个现成配方：① A 原版 → 0.2 秒后 A 升调加速 → 再 0.2 秒后 A 降调减速 → A 播完接 B；"
                 "② ABCD 每次随机抽 3 个、间隔 1 秒。",
             ),
@@ -3690,6 +3777,17 @@ class HelpPage(QWidget):
                 "才轮到换下一台设备；就算设备谎报「支持」，真打不开也会自动往下退，"
                 "状态栏会写「已自动适配到 16kHz 单声道」。"
                 "真起不来时，日志里会写清楚试了几种格式、每一种是因为什么失败的。",
+            ),
+            (
+                "Q18 按什么都没反应，是不是卡死了？（暂停功能）",
+                "多半是你自己把软件「暂停」了，不是卡死。\n"
+                "怎么进去的：长按轮盘键弹出轮盘、光标停在中间那个圆点上松手。"
+                "这一下本来是「别放，停」，现在顺手把软件也暂停了，免得误触。\n"
+                "怎么出来（两条路，任选其一）：\n"
+                "　 ① 再长按轮盘键，光标停在圆点上松手一次；\n"
+                "　 ② 长按轮盘键，正常划到某个音效上松手——音效会播，同时也解除暂停。\n"
+                "　 暂停和恢复的瞬间屏幕中间会闪一个小提示，一闪就消失，不会一直挂在上面。\n"
+                "　 嫌这个功能碍事？目前没法单独关掉它，但只要你不在圆点上松手就不会触发。",
             ),
         ]
         for q, a in faq:

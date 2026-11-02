@@ -162,8 +162,11 @@ def main() -> int:
     w.bank = bank
     w.playing = True
     src = Path(ROOT / "sr_roulette.py").read_text(encoding="utf-8")
-    check('"松开停止播放" if self.playing else "松开取消"' in src,
-          "中空区域文案分两态")
+    # 中心松手从"取消"升级成"停止并暂停"，文案跟着变成三态
+    check('"松开停止并暂停" if self.playing else "松开暂停"' in src,
+          "中空区域文案：没暂停时提示会暂停")
+    check('sub_hint = "松开恢复"' in src,
+          "中空区域文案：暂停中提示恢复")
 
     print("\n" + ("全部通过" if not FAILS else f"{len(FAILS)} 项失败: {FAILS}"))
     return 0 if not FAILS else 1

@@ -85,6 +85,7 @@ from pathlib import Path
 import numpy as np
 from PySide6.QtCore import (
     QAbstractNativeEventFilter,
+    QEasingCurve,
     QEventLoop,
     QIODevice,
     QObject,
@@ -94,6 +95,7 @@ from PySide6.QtCore import (
     Qt,
     QTimer,
     QUrl,
+    QVariantAnimation,
     Signal,
 )
 from PySide6.QtGui import (
@@ -142,7 +144,7 @@ import theme
 from theme import accent, accent_dark, accent_light, set_accent
 
 APP_NAME = "SR Voiceover Roulette"
-APP_VERSION = "v0.8.1"
+APP_VERSION = "v0.8.2"
 
 DEBUG = os.environ.get("SR_DEBUG") == "1"
 
@@ -261,6 +263,7 @@ def vk_of(name: str) -> int:
     table = {
         "space": 0x20, "tab": 0x09, "enter": 0x0D, "esc": 0x1B,
         "shift": 0x10, "ctrl": 0x11, "alt": 0x12, "capslock": 0x14,
+        "win": 0x5B, "lwin": 0x5B, "rwin": 0x5C,
         "comma": 0xBC, "period": 0xBE, "slash": 0xBF,
         "semicolon": 0xBA, "quote": 0xDE,
         "lshift": 0xA0, "rshift": 0xA1, "lctrl": 0xA2, "rctrl": 0xA3,
@@ -270,6 +273,62 @@ def vk_of(name: str) -> int:
         "mouse_middle": 0x04, "mouse_4": 0x05, "mouse_5": 0x06,
     }
     return table.get(name, 0x59)
+
+
+# ---- 组合键 ----
+# 修饰键统一映射到通用名：GetAsyncKeyState 查 0x11 时左右两个 Ctrl 都算按下，
+# 所以 "ctrl+y" 对左右手都成立，不用逼用户记住自己绑的是哪一只。
+_SPEC_MODS = {
+    "ctrl": "ctrl", "control": "ctrl", "lctrl": "ctrl", "rctrl": "ctrl",
+    "shift": "shift", "lshift": "shift", "rshift": "shift",
+    "alt": "alt", "lalt": "alt", "ralt": "alt",
+    "win": "win", "meta": "win", "cmd": "win", "super": "win",
+    "lwin": "win", "rwin": "win",
+}
+_MOD_ORDER = {"ctrl": 0, "alt": 1, "shift": 2, "win": 3}
+
+_SPEC_LABEL = {"ctrl": "Ctrl", "alt": "Alt", "shift": "Shift", "win": "Win"}
+
+
+def spec_parts(spec: str) -> list[str]:
+    """把 "ctrl+shift+y" 拆成 ["ctrl", "shift", "y"]，顺带规范化。
+
+    修饰键统一成 ctrl / alt / shift / win 四个通用名（左右不分），
+    并把顺序固定成 ctrl → alt → shift → win → 主键。这样
+    "shift+ctrl+y" 和 "ctrl+shift+y" 会被认成同一个绑定，
+    冲突检查才不会因为书写顺序不同而漏判。
+
+    单个键的旧写法（"y" / "f1" / "mouse_4"）走同一条路径，原样返回。
+    """
+    raw = [p.strip().lower() for p in str(spec or "").split("+")]
+    raw = [p for p in raw if p]
+    if not raw:
+        return []
+    mods: list[str] = []
+    keys: list[str] = []
+    for p in raw:
+        canon = _SPEC_MODS.get(p)
+        if canon is not None:
+            if canon not in mods:
+                mods.append(canon)
+        else:
+            keys.append(p)
+    mods.sort(key=lambda m: _MOD_ORDER.get(m, 9))
+    return mods + keys[:1]
+
+
+def norm_spec(spec: str) -> str:
+    """规范化后的字符串形式，用来存配置和比较冲突。"""
+    return "+".join(spec_parts(spec))
+
+
+def spec_label(spec: str) -> str:
+    """给人看的写法：ctrl+shift+y -> "Ctrl + Shift + Y"。"""
+    parts = spec_parts(spec)
+    if not parts:
+        return ""
+    return " + ".join(_SPEC_LABEL.get(p, p.upper()) for p in parts)
+
 
 
 def is_down(vk: int) -> bool:
@@ -750,6 +809,9 @@ DEFAULT_CONFIG = {
     "wheel_anchor": "screen",
     "opacity": 0.94,
     "show_names": True,
+    # 动画总开关（设置页「轮盘」那一栏）：关掉就全部瞬间显示/瞬间消失。
+    # 有人晕动/或者嫌动画挡视线，给一个一刀切的出口。
+    "animations": True,
     "poll_ms": 8,
     "fade_ms": 6,
     "audio_buffer_ms": 60,
@@ -3048,8 +3110,115 @@ class WheelWidget(QWidget):
         self.raw_ok = True
         # 供中空区域的提示文案用：有声音在响时，松手是"停"而不是"取消"
         self.playing = False
+        # 程序是不是处于"用户暂停"状态：中心提示要变成"松开恢复"
+        self.paused = False
         # 这套轮盘自己的颜色（(r,g,b) 或 "#rrggbb"）；None = 跟随应用主题色
         self.accent_rgb = None
+        # ---- 动画状态 ----
+        # anim_scale / anim_alpha 只在动画进行时偏离 1.0，
+        # 静止时保持 1.0 → paintEvent 走"直接画"的零开销路径。
+        self.anim_scale = 1.0
+        self.anim_alpha = 1.0
+        self._anim_open: QVariantAnimation | None = None
+        self._anim_close: QVariantAnimation | None = None
+        # 关窗动画播到一半又被叫去显示时，靠这个代号让旧的回调失效
+        self._anim_gen = 0
+        # 动画期间把绘制目标换成离屏图，静止时是 None（直接画到控件上）
+        self._paint_to = None
+
+    # ---- 动画 ----
+    def anim_on(self) -> bool:
+        return bool(self.cfg.get("animations", True))
+
+    def anim_busy(self) -> bool:
+        return self.anim_scale < 0.999 or self.anim_alpha < 0.999
+
+    def stop_anims(self) -> None:
+        """立刻掐掉正在跑的动画。
+
+        必须先让旧代号失效再 stop()：QAbstractAnimation.stop() 在 Qt 里
+        会照常发出 finished，不拦一下的话，"关窗动画"会在新一次弹出之后
+        把刚显示的轮盘又藏起来。
+        """
+        self._anim_gen += 1
+        for a in (self._anim_open, self._anim_close):
+            if a is not None:
+                a.stop()
+        self._anim_open = None
+        self._anim_close = None
+        self.anim_scale = 1.0
+        self.anim_alpha = 1.0
+
+    def play_open_anim(self) -> None:
+        """弹出：从略小、全透明长到正常大小。快起慢收，约 0.15 秒。"""
+        self.stop_anims()
+        if not self.anim_on():
+            self.update()
+            return
+        self.anim_scale = 0.86
+        self.anim_alpha = 0.0
+
+        a = QVariantAnimation(self)
+        a.setStartValue(0.0)
+        a.setEndValue(1.0)
+        a.setDuration(150)
+        a.setEasingCurve(QEasingCurve.OutCubic)
+
+        def on_tick(v) -> None:
+            t = float(v)
+            self.anim_scale = 0.86 + 0.14 * t
+            self.anim_alpha = min(1.0, t * 1.35)   # 透明度比尺寸先到位，观感更利索
+            self.update()
+
+        def on_done() -> None:
+            if gen != self._anim_gen:
+                return
+            self.anim_scale = 1.0
+            self.anim_alpha = 1.0
+            self._anim_open = None
+            self.update()
+
+        gen = self._anim_gen
+        a.valueChanged.connect(on_tick)
+        a.finished.connect(on_done)
+        self._anim_open = a
+        a.start()
+
+    def play_close_anim(self, on_done) -> None:
+        """释放/收起：整体轻微涨大同时淡出，约 0.18 秒。
+
+        选中格保持高亮不动，涨大那一下看起来像"把音效甩出去"。
+        """
+        self.stop_anims()
+        if not self.anim_on():
+            on_done()
+            return
+
+        a = QVariantAnimation(self)
+        a.setStartValue(0.0)
+        a.setEndValue(1.0)
+        a.setDuration(180)
+        a.setEasingCurve(QEasingCurve.OutQuad)
+
+        def on_tick(v) -> None:
+            t = float(v)
+            self.anim_scale = 1.0 + 0.05 * t
+            self.anim_alpha = max(0.0, 1.0 - t * 1.15)
+            self.update()
+
+        def on_finish() -> None:
+            if gen != self._anim_gen:
+                return          # 已经被新一次弹出接管，别把轮盘藏掉
+            self.anim_scale = 1.0
+            self.anim_alpha = 1.0
+            self._anim_close = None
+            on_done()
+
+        gen = self._anim_gen
+        a.valueChanged.connect(on_tick)
+        a.finished.connect(on_finish)
+        self._anim_close = a
+        a.start()
 
     def view_scale(self) -> float:
         """配置窗口里的预览要整体等比缩放。
@@ -3095,20 +3264,43 @@ class WheelWidget(QWidget):
     def paintEvent(self, event) -> None:  # noqa: N802
         if self.bank is None:
             return
-        # 每套轮盘有各自的颜色：画之前把它压到主题色上面，画完自动还原。
-        # 这样下面几百行绘制代码里的 accent() 一行都不用改。
+        if not self.anim_busy():
+            # 静止状态：直接画到控件上，跟没加动画时完全一样，零额外开销
+            theme.push_accent(self.accent_rgb)
+            try:
+                self._paint_body(event)
+            finally:
+                theme.pop_accent()
+            return
+        # 动画中：先画一张同样大小的离屏图，再带透明度/缩放贴回控件。
+        # 只在动画那零点二秒里走这条路，平时跑不到这里。
+        pm = QPixmap(self.size())
+        pm.fill(Qt.transparent)
         theme.push_accent(self.accent_rgb)
         try:
+            self._paint_to = pm
             self._paint_body(event)
         finally:
+            self._paint_to = None
             theme.pop_accent()
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        p.setOpacity(max(0.0, min(1.0, self.anim_alpha)))
+        if abs(self.anim_scale - 1.0) > 1e-4:
+            cx, cy = self.width() / 2.0, self.height() / 2.0
+            p.translate(cx, cy)
+            p.scale(self.anim_scale, self.anim_scale)
+            p.translate(-cx, -cy)
+        p.drawPixmap(0, 0, pm)
+        p.end()
 
     def _paint_body(self, event) -> None:
         cfg = self.cfg
         cx, cy = self.width() / 2.0, self.height() / 2.0
         opacity = float(cfg["opacity"])
 
-        p = QPainter(self)
+        p = QPainter(self._paint_to if self._paint_to is not None else self)
         p.setRenderHint(QPainter.Antialiasing, True)
         p.setRenderHint(QPainter.TextAntialiasing, True)
 
@@ -3223,7 +3415,11 @@ class WheelWidget(QWidget):
             sub_hint = "请查看 sr_roulette.log"
         elif selected is None:
             main_hint = "移动鼠标选择"
-            sub_hint = "松开停止播放" if self.playing else "松开取消"
+            # 中心松手现在既是"停"也是"暂停"，文案要把这层意思说清楚
+            if getattr(self, "paused", False):
+                sub_hint = "松开恢复"
+            else:
+                sub_hint = "松开停止并暂停" if self.playing else "松开暂停"
         else:
             main_hint = fm1.elidedText(
                 self.bank.name_at(selected), Qt.ElideRight, int(inner * 1.6)
@@ -3587,6 +3783,166 @@ class WheelSwitchController(QObject):
 
 # ---------------------------------------------------------------- 轮盘控制
 
+class PauseToast(QWidget):
+    """暂停 / 恢复时在屏幕中间闪一下的小提示。
+
+    播完就消失，不会在屏幕上留常驻标识（用户要的是"只放动画不留痕迹"）。
+    和轮盘一样是置顶 + 整窗鼠标穿透 + 不抢焦点，绝不会挡住游戏里的操作。
+
+    为什么要给这个提示：进入暂停后所有快捷键都不响应，屏幕上什么都不提示的话，
+    用户只会觉得"程序卡死了"，然后去任务管理器把它杀掉。
+    """
+
+    STYLE_MS = 950
+
+    def __init__(self, cfg: dict) -> None:
+        super().__init__(
+            None,
+            Qt.Tool
+            | Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.WindowDoesNotAcceptFocus,
+        )
+        self.cfg = cfg
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setFixedSize(306, 108)
+        self.paused = True
+        self.t = 0.0
+        self._anim: QVariantAnimation | None = None
+
+    def apply_style(self) -> None:
+        try:
+            hwnd = int(self.winId())
+            style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            style |= WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+        except Exception as exc:
+            _log(f"[pause] 设置提示窗样式失败: {exc}")
+
+    def flash(self, paused: bool) -> None:
+        """播一次提示。动画关掉时直接不闪——
+        这种提示的全部信息都在动画里，没动画就只剩一个突然出现的方块。"""
+        self.paused = bool(paused)
+        if not bool(self.cfg.get("animations", True)):
+            self.hide()
+            return
+        sx, sy = cursor_pos()
+        screen = QApplication.screenAt(QPoint(sx, sy)) or QApplication.primaryScreen()
+        geo = screen.geometry() if screen else None
+        if geo is not None:
+            x = geo.center().x() - self.width() // 2
+            # 略高于屏幕正中：轮盘弹出来时中心是空的，两边不会打架
+            y = geo.center().y() - self.height() // 2 - 40
+            self.setGeometry(x, y, self.width(), self.height())
+
+        if self._anim is not None:
+            self._anim.stop()
+        self.apply_style()
+        self.t = 0.0
+        self.show()
+        self.raise_()
+
+        a = QVariantAnimation(self)
+        a.setStartValue(0.0)
+        a.setEndValue(1.0)
+        a.setDuration(self.STYLE_MS)
+        a.setEasingCurve(QEasingCurve.Linear)
+        a.valueChanged.connect(self._on_tick)
+        a.finished.connect(self.hide)
+        self._anim = a
+        a.start()
+
+    def _on_tick(self, v) -> None:
+        self.t = float(v)
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        t = max(0.0, min(1.0, self.t))
+        # 三段：0~0.16 冒出来，0.16~0.72 停住，0.72~1 淡出
+        if t < 0.16:
+            k = t / 0.16
+            appear = 1.0 - (1.0 - k) ** 3          # 快起慢收
+            alpha = k
+            rise = (1.0 - appear) * 10.0
+        elif t > 0.72:
+            k = (t - 0.72) / 0.28
+            appear = 1.0
+            alpha = 1.0 - k
+            rise = k * 6.0
+        else:
+            appear = 1.0
+            alpha = 1.0
+            rise = 0.0
+        if alpha <= 0.003:
+            return
+
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setRenderHint(QPainter.TextAntialiasing, True)
+        p.setOpacity(min(1.0, alpha))
+
+        cx, cy = self.width() / 2.0, self.height() / 2.0
+        scale = 0.90 + 0.10 * appear
+        p.translate(cx, cy + rise)
+        p.scale(scale, scale)
+        p.translate(-cx, -cy)
+
+        # ---- 胶囊底板 ----
+        pill = QRectF(10, 30, self.width() - 20, 52)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(0, 0, 0, 70))
+        p.drawRoundedRect(pill.adjusted(-1, 3, 1, 4), 26, 26)
+        p.setBrush(QColor(18, 20, 26, 240))
+        p.setPen(QPen(accent(210), 1.6))
+        p.drawRoundedRect(pill, 26, 26)
+
+        # ---- 图标 ----
+        ix = pill.left() + 27
+        iy = pill.center().y()
+        if self.paused:
+            p.setPen(Qt.NoPen)
+            p.setBrush(accent(245))
+            p.drawRoundedRect(QRectF(ix - 6, iy - 9, 4.6, 18), 2.0, 2.0)
+            p.drawRoundedRect(QRectF(ix + 1.4, iy - 9, 4.6, 18), 2.0, 2.0)
+        else:
+            p.setBrush(accent(245))
+            p.setPen(Qt.NoPen)
+            tri = QPolygonF([
+                QPointF(ix - 5, iy - 9),
+                QPointF(ix - 5, iy + 9),
+                QPointF(ix + 8, iy),
+            ])
+            p.drawPolygon(tri)
+
+        # ---- 文字 ----
+        f = QFont(UI_FONT)
+        f.setPointSize(12)
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(QPen(QColor(238, 242, 248, 250)))
+        title = "已暂停" if self.paused else "已恢复"
+        p.drawText(
+            QRectF(pill.left() + 48, pill.top() + 6, pill.width() - 60, 24),
+            Qt.AlignLeft | Qt.AlignVCenter,
+            title,
+        )
+
+        f2 = QFont(UI_FONT)
+        f2.setPointSize(9)
+        p.setFont(f2)
+        p.setPen(QPen(QColor(150, 158, 172, 240)))
+        hint = "快捷键暂时失效，长按轮盘键可恢复" if self.paused else "快捷键可以用了"
+        p.drawText(
+            QRectF(pill.left() + 48, pill.top() + 26, pill.width() - 58, 20),
+            Qt.AlignLeft | Qt.AlignVCenter,
+            hint,
+        )
+        p.end()
+
+
 class WheelController(QObject):
     """负责显示/隐藏、虚拟光标推进、选中判定。"""
 
@@ -3656,16 +4012,33 @@ class WheelController(QObject):
         # 打开那一刻就同步"有没有声音在响"，中空区域的提示文案才不会说反
         self.widget.playing = bool(self.audio.playing) if self.audio else False
         self.widget.apply_style()
+        # 先把动画状态摆好再 show：否则第一帧会以"完整大小"闪一下再缩小重来
+        self.widget.play_open_anim()
         self.widget.show()
         self.widget.raise_()
         self.widget.update()
         if DEBUG:
             _log(f"[wheel] 显示于 {ccx},{ccy} window={self.widget.geometry()}")
 
-    def hide_wheel(self) -> None:
+    def hide_wheel(self, animate: bool = True, keep_flash: bool = False) -> None:
+        """收起轮盘。
+
+        animate=True 先播一段释放动画再真正隐藏。
+        keep_flash=True 时保留选中格的高亮，让"甩出去"那一下看得见是哪个音效。
+        active 立刻置 False：动画期间输入逻辑认为轮盘已经关了，
+        否则那零点二秒里继续读鼠标会误判选中。
+        """
         self.active = False
-        self.widget.hide()
         self.selected = None
+        if not keep_flash:
+            self.widget.selected = None
+        if not self.widget.isVisible():
+            return
+        if animate:
+            self.widget.play_close_anim(self.widget.hide)
+        else:
+            self.widget.stop_anims()
+            self.widget.hide()
 
     def poll_selection(self) -> None:
         if not self.active:
@@ -3715,7 +4088,8 @@ class WheelController(QObject):
 
     def commit(self) -> int | None:
         idx = self.selected
-        self.hide_wheel()
+        # 选中了就把那一格留着高亮播释放动画；空手松手就正常收起
+        self.hide_wheel(keep_flash=idx is not None)
         return idx
 
 
@@ -3756,7 +4130,7 @@ class InputPoller(QObject):
         self._sw_at = 0.0
         # 用户选中了另一套轮盘时调这里（由主程序接上"真的去切"）
         self.on_switch_wheel: object = None
-        self.hotkey_name = str(cfg["hotkey"]).strip().lower() or "y"
+        self.hotkey_name = norm_spec(cfg["hotkey"]) or "y"
         self.vk = vk_of(self.hotkey_name)
         self._prev = False
         self._press_at = 0.0
@@ -3773,6 +4147,11 @@ class InputPoller(QObject):
         self._extra_prev: dict[int, bool] = {}
         # 返回 True 时暂停响应按键（配置窗口打开时用，免得打字把轮盘弹出来）
         self.paused: object = None
+        # 用户自己按出来的暂停（轮盘中心松手）。和上面那个"设置窗口占着键盘"
+        # 的临时让路是两回事：这个必须用户再操作一次才会解除。
+        self.user_paused = False
+        # 暂停状态变了通知外面（主程序用它播暂停/恢复动画）
+        self.on_pause_changed: object = None
         self.rebuild_bindings()
 
     def run_tap_action(self) -> bool:
@@ -3784,6 +4163,21 @@ class InputPoller(QObject):
             return self.audio.play_next()
         return False
 
+    def set_user_pause(self, on: bool) -> None:
+        """进入/退出用户暂停。
+
+        暂停期间只挡"轻按动作"和额外快捷键，**轮盘本身照常能长按打开**。
+        这是故意留的活路：如果连轮盘都挡住，用户被自己暂停了就再也没办法
+        用键盘解除，只能去托盘右键退出程序。
+        """
+        on = bool(on)
+        if on == self.user_paused:
+            return
+        self.user_paused = on
+        _log(f"[pause] {'暂停' if on else '恢复'}")
+        if callable(self.on_pause_changed):
+            self.on_pause_changed(on)
+
     def _tick_switch(self) -> None:
         """按住"切换轮盘的键"弹出小轮盘，划到哪套松手就切过去。
 
@@ -3791,11 +4185,11 @@ class InputPoller(QObject):
         （这个键没有"轻按动作"，误触比漏触更烦人）。
         """
         sw = self.switcher
-        key = str(self.cfg.get("switch_key", "") or "").strip().lower()
+        key = norm_spec(self.cfg.get("switch_key", ""))
         if sw is None or not key or key == self.hotkey_name:
             self._sw_prev = False
             return
-        if self.paused is not None and self.paused():
+        if self.user_paused or (self.paused is not None and self.paused()):
             self._sw_prev = self._down(key)
             self._sw_at = time.monotonic()
             return
@@ -3819,19 +4213,30 @@ class InputPoller(QObject):
             sw.poll_selection()
 
     def set_hotkey(self, name: str) -> None:
-        """换呼出键。键盘和鼠标按键都支持。"""
-        self.hotkey_name = (name or "y").strip().lower() or "y"
+        """换呼出键。键盘、鼠标、组合键都支持。"""
+        self.hotkey_name = norm_spec(name) or "y"
         self.vk = vk_of(self.hotkey_name)
         self._prev = self._down(self.hotkey_name)
         self._press_at = time.monotonic()
 
     def _down(self, name: str) -> bool:
-        """某个"按键名"现在是不是按下状态。键盘鼠标都走这里。"""
-        if name in MOUSE_KEYS:
-            raw = getattr(self.wheel, "raw", None)
-            if raw is not None and getattr(raw, "registered", False):
-                return raw.button_down(name)
-        return is_down(vk_of(name))
+        """这个绑定现在是不是按着。
+
+        支持单键（"y" / "mouse_4"）和组合键（"ctrl+shift+y"）：
+        组合键要求每一部分同时按着才算，少一个都不行。
+        """
+        parts = spec_parts(name)
+        if not parts:
+            return False
+        raw = getattr(self.wheel, "raw", None)
+        raw_ok = raw is not None and getattr(raw, "registered", False)
+        for p in parts:
+            if p in MOUSE_KEYS and raw_ok:
+                if not raw.button_down(p):
+                    return False
+            elif not is_down(vk_of(p)):
+                return False
+        return True
 
     def rebuild_bindings(self) -> None:
         """重建"额外快捷键"绑定。改了快捷键或增删音效后调用一次。
@@ -3841,26 +4246,26 @@ class InputPoller(QObject):
         映射到同一个码时互相顶掉。
         """
         bindings: list[tuple[str, object]] = []
-        seen: set[str] = {str(self.cfg.get("hotkey", "y")).strip().lower()}
+        seen: set[str] = {norm_spec(self.cfg.get("hotkey", "y"))}
 
-        rk = str(self.cfg.get("repeat_last_key", "") or "").strip().lower()
+        rk = norm_spec(self.cfg.get("repeat_last_key", ""))
         if rk and rk not in seen:
             bindings.append((rk, self.audio.play_repeat_last))
             seen.add(rk)
 
-        ck = str(self.cfg.get("cycle_key", "") or "").strip().lower()
+        ck = norm_spec(self.cfg.get("cycle_key", ""))
         if ck and ck not in seen:
             bindings.append((ck, self.audio.play_next))
             seen.add(ck)
 
-        sk = str(self.cfg.get("switch_key", "") or "").strip().lower()
+        sk = norm_spec(self.cfg.get("switch_key", ""))
         if sk:
             seen.add(sk)      # 切换轮盘的键不参与"播放音效"绑定，这里只是占位防冲突
 
         scfg = getattr(self.audio.bank, "scfg", None)
         if scfg is not None:
             for key, name in scfg.hotkey_map().items():
-                key = (key or "").strip().lower()
+                key = norm_spec(key)
                 if not key or key in seen:
                     continue
                 bindings.append((key, lambda n=name: self.audio.play_named(n)))
@@ -3917,15 +4322,22 @@ class InputPoller(QObject):
                     if DEBUG:
                         _log(f"[play] {idx}")
                     self.audio.play(idx)
+                    # 选了音效 = 本来就在干活，顺手退出暂停
+                    if self.user_paused:
+                        self.set_user_pause(False)
                 else:
-                    # 指回中空区域松手 = "别放，停"：立刻掐掉正在响的声音。
-                    # 以前这里是纯取消（什么都不做），想喊停只能等它自己放完。
+                    # 指回中空区域松手：先掐掉正在响的声音，再切换暂停状态。
+                    # 同一个动作既进也出：暂停中再做一次就是恢复，
+                    # 这是用户能把自己救出来的两条路之一（另一条是选音效）。
                     if DEBUG:
                         _log("[stop] 中空区域松手，停止播放")
                     self.audio.stop_all()
+                    self.set_user_pause(not self.user_paused)
             elif not self._held_to_wheel:
-                # 轻按热键：没长到弹轮盘，就执行配置的"轻按动作"
-                self.run_tap_action()
+                # 轻按热键：没长到弹轮盘，就执行配置的"轻按动作"。
+                # 暂停期间这一下要挡掉，否则暂停就名不副实了。
+                if not self.user_paused:
+                    self.run_tap_action()
         self._prev = down
 
         # 轮盘弹着的时候按鼠标左键/右键 = 立刻取消这次呼出。
@@ -3945,7 +4357,7 @@ class InputPoller(QObject):
         # 额外快捷键：只在"按下的那一下"触发，按住不会连发
         for key, action in self._extra:
             d = self._down(key)
-            if d and not self._extra_prev.get(key, False):
+            if d and not self._extra_prev.get(key, False) and not self.user_paused:
                 action()
             self._extra_prev[key] = d
 
@@ -4035,10 +4447,21 @@ def main() -> int:
     switcher = WheelSwitchController(cfg, scfg, raw)
     poller = InputPoller(cfg, wheel, audio, switcher)
     poller.paused = lambda: settings_blocks_hotkey(_settings_holder.get("win"))
+
+    # 用户暂停/恢复：改轮盘中心的提示文案，再在屏幕上闪一下
+    pause_toast = PauseToast(cfg)
+
+    def on_user_pause(on: bool) -> None:
+        wheel.widget.paused = bool(on)
+        if wheel.widget.isVisible():
+            wheel.widget.update()
+        pause_toast.flash(bool(on))
+
+    poller.on_pause_changed = on_user_pause
     icon = make_icon()
     app.setWindowIcon(icon)
     tray = QSystemTrayIcon(icon, app)
-    tray.setToolTip(f"{APP_NAME} {APP_VERSION}\n长按 {str(cfg['hotkey']).upper()} 打开轮盘")
+    tray.setToolTip(f"{APP_NAME} {APP_VERSION}\n长按 {spec_label(cfg['hotkey'])} 打开轮盘")
 
     # 链路出问题直接弹气泡：设置窗口关着、人在游戏里，也能第一时间知道
     # （以前只写进设置页那行小字，用户永远看不见，还以为一切正常）
@@ -4094,7 +4517,7 @@ def main() -> int:
                 tray.setIcon(icon)
                 act_count.setText(f"已加载音效：{len(audio)} 个（上限 {MAX_SLOTS}）")
                 tray.setToolTip(
-                    f"{APP_NAME} {APP_VERSION}\n长按 {str(cfg['hotkey']).upper()} 打开轮盘"
+                    f"{APP_NAME} {APP_VERSION}\n长按 {spec_label(cfg['hotkey'])} 打开轮盘"
                 )
 
             def on_params_changed() -> None:
@@ -4193,7 +4616,7 @@ def main() -> int:
     else:
         tray.showMessage(
             APP_NAME,
-            f"已就绪，长按 {str(cfg['hotkey']).upper()} 打开轮盘（{len(audio)} 个音效）",
+            f"已就绪，长按 {spec_label(cfg['hotkey'])} 打开轮盘（{len(audio)} 个音效）",
             QSystemTrayIcon.Information, 3000,
         )
 
