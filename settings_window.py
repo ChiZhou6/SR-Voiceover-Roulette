@@ -2720,8 +2720,9 @@ class WheelPage(QWidget):
         self.chk_anim = QCheckBox("开启动画")
         self.chk_anim.setChecked(bool(cfg.get("animations", True)))
         self.chk_anim.setToolTip(
-            "轮盘弹出时的展开、释放音效时的收起、暂停/恢复的提示，都走这一个开关。\n"
-            "关掉之后全部变成瞬间出现、瞬间消失——晕动或者嫌动画挡视线就关掉。"
+            "轮盘弹出时的展开、释放音效时选中那格飞出去、暂停/恢复的提示，\n"
+            "都走这一个开关。关掉之后全部变成瞬间出现、瞬间消失——\n"
+            "晕动或者嫌动画挡视线就关掉。"
         )
         lay.addWidget(self.chk_anim)
 

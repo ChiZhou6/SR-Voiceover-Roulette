@@ -275,6 +275,96 @@ check(ctl.widget.selected == 4, "释放动画期间选中格保持高亮")
 check(ctl.active is False, "commit 之后立刻认为轮盘已关闭（动画期间不读鼠标）")
 
 print()
+print("=== D 释放音效：整盘立刻消失，只留选中那一格 ===")
+
+from PySide6.QtGui import QImage  # noqa: E402
+
+
+class FakeBank:
+    """只为渲染服务的假音效库：够 len() 和 name_at() 用就行。"""
+
+    def __init__(self, names):
+        self.names = list(names)
+
+    def __len__(self):
+        return len(self.names)
+
+    def name_at(self, i):
+        return self.names[i]
+
+
+fb = FakeBank([f"音效{i}" for i in range(6)])
+
+
+def opaque_in(img, r=None):
+    """数不透明像素；r 给了就只数中心那块方块。"""
+    img = img.convertToFormat(QImage.Format_ARGB32)
+    cx, cy = img.width() // 2, img.height() // 2
+    if r is None:
+        x0, x1, y0, y1 = 0, img.width(), 0, img.height()
+    else:
+        x0, x1, y0, y1 = cx - r, cx + r, cy - r, cy + r
+    n = 0
+    for y in range(y0, y1):
+        for x in range(x0, x1):
+            if ((img.pixel(x, y) >> 24) & 0xFF) > 8:
+                n += 1
+    return n
+
+
+cfg_d = dict(sr.DEFAULT_CONFIG)
+w2 = sr.WheelWidget(cfg_d)
+w2.bank = fb
+w2.resize(560, 560)
+w2.selected = 2
+check(opaque_in(w2.grab().toImage(), r=30) > 0,
+      "对照：完整轮盘的中心是不透明的")
+
+done = []
+w2.play_flash_anim(lambda: done.append("hidden"))
+check(w2.anim_flash is True, "闪出开始后进入 flash 状态")
+check(done == [], "闪出刚开始还没有隐藏窗口")
+during = w2.grab().toImage()
+check(opaque_in(during, r=30) == 0, "闪出期间整盘已经消失（中心全透明）",
+      f"中心不透明像素={opaque_in(during, r=30)}")
+check(opaque_in(during) > 0, "选中那一格还在画", f"全图不透明像素={opaque_in(during)}")
+pump(320)
+check(done == ["hidden"], "闪出跑完才真正隐藏", str(done))
+check(w2.anim_flash is False, "闪出结束后 flash 状态复位")
+
+# 关掉动画：直接隐藏，不能留下一个只画半格的残影
+cfg_off2 = dict(sr.DEFAULT_CONFIG)
+cfg_off2["animations"] = False
+w3 = sr.WheelWidget(cfg_off2)
+w3.bank = fb
+w3.selected = 1
+done2 = []
+w3.play_flash_anim(lambda: done2.append("hidden"))
+check(done2 == ["hidden"], "关掉动画时释放立刻完成")
+check(w3.anim_flash is False, "关掉动画时不进入 flash 状态")
+
+# 闪到一半又弹出：旧回调不能把新轮盘藏掉
+w2.play_flash_anim(lambda: done.append("stale"))
+pump(40)
+w2.play_open_anim()
+pump(320)
+check(done == ["hidden"], "闪到一半又弹出时，旧回调不会藏掉新轮盘", str(done))
+check(w2.anim_flash is False, "重新弹出后 flash 状态是干净的")
+
+# 控制器这一层：选中了音效松手，走的是闪出动画
+ctl3 = sr.WheelController(
+    dict(sr.DEFAULT_CONFIG), fb,
+    SimpleNamespace(registered=False, drop=lambda: None), None,
+)
+ctl3.widget.bank = fb
+ctl3.widget.show()
+ctl3.selected = 3
+ctl3.widget.selected = 3
+ctl3.commit()
+check(ctl3.widget.anim_flash is True, "commit 松手走闪出动画（整盘消失）")
+ctl3.widget.hide()
+
+print()
 print(f"通过 {len(OK)} 项，失败 {len(BAD)} 项")
 if BAD:
     print("失败项：" + "；".join(BAD))

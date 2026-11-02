@@ -3119,6 +3119,8 @@ class WheelWidget(QWidget):
         # 静止时保持 1.0 → paintEvent 走"直接画"的零开销路径。
         self.anim_scale = 1.0
         self.anim_alpha = 1.0
+        # True = 正在播"释放音效"的闪出：整盘不画，只画选中那一格
+        self.anim_flash = False
         self._anim_open: QVariantAnimation | None = None
         self._anim_close: QVariantAnimation | None = None
         # 关窗动画播到一半又被叫去显示时，靠这个代号让旧的回调失效
@@ -3148,6 +3150,7 @@ class WheelWidget(QWidget):
         self._anim_close = None
         self.anim_scale = 1.0
         self.anim_alpha = 1.0
+        self.anim_flash = False
 
     def play_open_anim(self) -> None:
         """弹出：从略小、全透明长到正常大小。快起慢收，约 0.15 秒。"""
@@ -3218,6 +3221,54 @@ class WheelWidget(QWidget):
         a.valueChanged.connect(on_tick)
         a.finished.connect(on_finish)
         self._anim_close = a
+        a.start()
+
+    def play_flash_anim(self, on_done) -> None:
+        """释放音效：整盘立刻消失，只留选中那一格涨大淡出，约 0.2 秒。
+
+        和 play_close_anim 的区别是"画什么"：那个是整盘一起涨大淡出，
+        这个是 anim_flash=True 后 _paint_body 只画选中扇区——其余部分
+        当帧就没了，视觉上是"从轮盘里抽出一片甩出去"。
+        """
+        self.stop_anims()
+        if not self.anim_on() or self.selected is None:
+            on_done()
+            return
+
+        self.anim_flash = True
+        self.anim_scale = 1.0
+        self.anim_alpha = 1.0
+
+        a = QVariantAnimation(self)
+        a.setStartValue(0.0)
+        a.setEndValue(1.0)
+        a.setDuration(200)
+        # 用线性推进，两条曲线自己算：整体缓动的话，形状刚看清就已经淡没了
+        a.setEasingCurve(QEasingCurve.Linear)
+
+        def on_tick(v) -> None:
+            t = float(v)
+            grow = 1.0 - (1.0 - t) ** 2      # 尺寸前快后慢，像"甩"出去
+            # 0.06：轮盘半径最大 280 + 外圈 60 = 340，窗口四周只留 24px 余量，
+            # 涨太多或加发光都会把最外缘切掉一点点
+            self.anim_scale = 1.0 + 0.06 * grow
+            self.anim_alpha = max(0.0, 1.0 - t * t)   # 前段几乎不透明，后段才化掉
+            self.update()
+
+        def on_finish() -> None:
+            if gen != self._anim_gen:
+                return          # 已经被新一次弹出接管，别把轮盘藏掉
+            self.anim_flash = False
+            self.anim_scale = 1.0
+            self.anim_alpha = 1.0
+            self._anim_close = None
+            on_done()
+
+        gen = self._anim_gen
+        a.valueChanged.connect(on_tick)
+        a.finished.connect(on_finish)
+        self._anim_close = a
+        self.update()            # 先把整盘擦掉，别等第一帧
         a.start()
 
     def view_scale(self) -> float:
@@ -3295,6 +3346,76 @@ class WheelWidget(QWidget):
         p.drawPixmap(0, 0, pm)
         p.end()
 
+    def _paint_slot_names(self, p: QPainter, cx: float, cy: float, geo: dict,
+                          radius: float, only_idx: int | None = None) -> None:
+        """画扇区上的音效名。only_idx 给了就只画那一个音效的（闪出动画用）。"""
+        if not self.cfg.get("show_names", True):
+            return
+        selected = self.selected
+        font = QFont(UI_FONT)
+        font.setPointSize(9)
+        font.setWeight(QFont.DemiBold)
+        p.setFont(font)
+        fm = QFontMetrics(font)
+        for sid, idx in self.slot_pairs(geo):
+            if only_idx is not None and idx != only_idx:
+                continue
+            geom = slot_geometry(geo, sid)
+            if geom is None:
+                continue
+            r0, r1, start_deg, span = geom
+            tr = (r0 + r1) / 2.0
+            # 扇形在切向上的可用宽度（弦长）
+            tangent_w = 2.0 * tr * math.sin(math.radians(span / 2.0)) * 0.92
+            rad = math.radians(start_deg - span / 2.0)
+            tx = cx + tr * math.cos(rad)
+            ty = cy - tr * math.sin(rad)
+            # 文字是水平排布的，除了受扇形弦长限制，还必须夹在轮盘的
+            # 左右边缘以内。只有 2 个音效时扇区宽 180°，文字中心几乎
+            # 贴着轮盘边缘，不夹住就会画出窗口被裁掉半截。
+            edge_room = min(tx - (cx - radius + 8.0), (cx + radius - 8.0) - tx)
+            label_w = max(28.0, min(tangent_w, max(0.0, edge_room) * 2.0))
+            raw = self.bank.name_at(idx)
+            text = fm.elidedText(raw, Qt.ElideRight, int(label_w))
+            # 选中扇区是亮色填充，文字必须反过来用深色，否则糊成一片
+            color = (
+                QColor(14, 42, 24, 255)
+                if idx == selected
+                else QColor(198, 202, 212, 235)
+            )
+            p.setPen(QPen(color))
+            p.drawText(
+                QRectF(tx - label_w / 2, ty - 9, label_w, 18),
+                Qt.AlignCenter,
+                text,
+            )
+
+    def _paint_flash_sector(self, p: QPainter, cx: float, cy: float,
+                            geo: dict, selected: int) -> None:
+        """只画"松开手时选中的那一格"。释放动画专用。
+
+        轮盘本体在这一帧已经全部不画了，所以这里不能依赖任何别的绘制，
+        自己把填充、描边、外发光都补齐。
+        """
+        for sid, idx in self.slot_pairs(geo):
+            if idx != selected:
+                continue
+            geom = slot_geometry(geo, sid)
+            if geom is None:
+                return
+            r0, r1, start_deg, span = geom
+            path = ring_sector_path(cx, cy, r0, r1, start_deg, span)
+            # 外发光：同一条路径先用粗半透明笔画一遍，边缘有一点溢出的感觉
+            glow = accent_light(70)
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(glow, 7.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            p.drawPath(path)
+            p.setBrush(accent(240))
+            p.setPen(QPen(accent_light(255), 2.2))
+            p.drawPath(path)
+            self._paint_slot_names(p, cx, cy, geo, geo["extent"], only_idx=idx)
+            return
+
     def _paint_body(self, event) -> None:
         cfg = self.cfg
         cx, cy = self.width() / 2.0, self.height() / 2.0
@@ -3311,6 +3432,13 @@ class WheelWidget(QWidget):
         inner = geo["hole"]
         n = max(1, count)
         selected = self.selected
+
+        # 释放动画：轮盘本体已经"整盘消失"，只剩选中那一格在涨大淡出。
+        # 放在最前面短路掉，后面那些扇区/中心圆/文字一个都不画。
+        if self.anim_flash and selected is not None:
+            self._paint_flash_sector(p, cx, cy, geo, selected)
+            p.end()
+            return
 
         if count == 0:
             # 一个音效都没有：画个虚线圈提示可以拖，别画一个写着"空槽位"的扇区
@@ -3353,42 +3481,7 @@ class WheelWidget(QWidget):
         p.drawEllipse(QRectF(cx - inner, cy - inner, inner * 2, inner * 2))
 
         # 扇区文字（内圈外圈各一遍，位置都由 slot_geometry 决定）
-        if cfg.get("show_names", True):
-            font = QFont(UI_FONT)
-            font.setPointSize(9)
-            font.setWeight(QFont.DemiBold)
-            p.setFont(font)
-            fm = QFontMetrics(font)
-            for sid, idx in self.slot_pairs(geo):
-                geom = slot_geometry(geo, sid)
-                if geom is None:
-                    continue
-                r0, r1, start_deg, span = geom
-                tr = (r0 + r1) / 2.0
-                # 扇形在切向上的可用宽度（弦长）
-                tangent_w = 2.0 * tr * math.sin(math.radians(span / 2.0)) * 0.92
-                rad = math.radians(start_deg - span / 2.0)
-                tx = cx + tr * math.cos(rad)
-                ty = cy - tr * math.sin(rad)
-                # 文字是水平排布的，除了受扇形弦长限制，还必须夹在轮盘的
-                # 左右边缘以内。只有 2 个音效时扇区宽 180°，文字中心几乎
-                # 贴着轮盘边缘，不夹住就会画出窗口被裁掉半截。
-                edge_room = min(tx - (cx - radius + 8.0), (cx + radius - 8.0) - tx)
-                label_w = max(28.0, min(tangent_w, max(0.0, edge_room) * 2.0))
-                raw = self.bank.name_at(idx)
-                text = fm.elidedText(raw, Qt.ElideRight, int(label_w))
-                # 选中扇区是亮色填充，文字必须反过来用深色，否则糊成一片
-                color = (
-                    QColor(14, 42, 24, 255)
-                    if idx == selected
-                    else QColor(198, 202, 212, 235)
-                )
-                p.setPen(QPen(color))
-                p.drawText(
-                    QRectF(tx - label_w / 2, ty - 9, label_w, 18),
-                    Qt.AlignCenter,
-                    text,
-                )
+        self._paint_slot_names(p, cx, cy, geo, radius)
 
         # 中心提示
         f1 = QFont(UI_FONT)
@@ -4023,8 +4116,9 @@ class WheelController(QObject):
     def hide_wheel(self, animate: bool = True, keep_flash: bool = False) -> None:
         """收起轮盘。
 
-        animate=True 先播一段释放动画再真正隐藏。
-        keep_flash=True 时保留选中格的高亮，让"甩出去"那一下看得见是哪个音效。
+        animate=True 先播一段动画再真正隐藏：
+          · keep_flash=True（选中了音效松手）→ 整盘立刻消失，只留那一格涨大淡出
+          · keep_flash=False（取消 / 切换轮盘）→ 整盘一起涨大淡出
         active 立刻置 False：动画期间输入逻辑认为轮盘已经关了，
         否则那零点二秒里继续读鼠标会误判选中。
         """
@@ -4034,7 +4128,9 @@ class WheelController(QObject):
             self.widget.selected = None
         if not self.widget.isVisible():
             return
-        if animate:
+        if animate and keep_flash and self.widget.selected is not None:
+            self.widget.play_flash_anim(self.widget.hide)
+        elif animate:
             self.widget.play_close_anim(self.widget.hide)
         else:
             self.widget.stop_anims()
