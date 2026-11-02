@@ -1,0 +1,13 @@
+# 统一行尾：源码用 LF，免得 Windows / Linux 来回切换产生满屏假 diff
+* text=auto eol=lf
+*.bat text eol=crlf
+
+# 这些别当文本处理，否则 Git 可能改动字节
+*.wav binary
+*.mp3 binary
+*.ogg binary
+*.flac binary
+*.m4a binary
+*.ico binary
+*.png binary
+*.zip binary

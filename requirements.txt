@@ -1,0 +1,5 @@
+PySide6>=6.6
+numpy>=1.24
+
+# 打包 exe 时才需要：
+#   pip install pyinstaller

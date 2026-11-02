@@ -1,0 +1,36 @@
+# ---- 运行期生成（每台机器都不一样，不进仓库） ----
+config.json
+sounds.json
+sr_roulette.log
+*.log
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- PyInstaller 打包产物 ----
+build/
+dist/
+*.zip
+
+# ---- 本地大文件 / 第三方内容（体积大或不该由本仓库分发） ----
+_exe_sandbox/
+_tmp_audio/
+_video/
+_vbcable/
+.workbuddy/
+SR Voiceover Roulette_发布版/
+
+# ---- 调试截图（要放进文档的图在 docs/） ----
+_tests/*.png
+settings_mic.png
+settings_speed.png
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+Thumbs.db
+desktop.ini
