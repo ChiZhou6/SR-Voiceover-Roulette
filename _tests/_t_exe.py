@@ -255,7 +255,10 @@ def main() -> int:
             check(user32.GetForegroundWindow() != hwnd, "没有抢前台焦点")
 
         send_key(VK_Y, up=True)
-        time.sleep(0.5)
+        # 松手要等 200ms 的"闪出"动画播完才 hide（实测 210ms），
+        # 加上子进程检测 up 事件、动画收尾的处理延迟，0.5 秒会偶发误报。
+        # 和 _t_e2e.py 保持同一个余量。
+        time.sleep(2.0)
         check(len(wheel_windows(proc.pid)) == 0, "松开后轮盘隐藏")
         check(proc.poll() is None, "全程未崩溃")
 

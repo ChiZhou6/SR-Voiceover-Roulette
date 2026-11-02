@@ -126,7 +126,7 @@ def main() -> int:
     wheel.show_wheel()
     g = wheel.widget.geometry()
     # 窗口大小按"最外缘"算：内圈直径之外还要算上外圈（如果有）
-    extent = sr.ring_layout(wheel.cfg, len(bank), 1.0)["extent"]
+    extent = sr.ring_layout(wheel.cfg, len(bank), sr.wheel_scale_of(wheel.cfg))["extent"]
     check(abs(g.width() - (extent * 2 + 48)) <= 2, "下次弹出真的变大", f"{g.width()}px")
     wheel.hide_wheel()
 
@@ -142,17 +142,35 @@ def main() -> int:
     app.processEvents()
     check(disk().get("show_names") is False, "显示音效名写入", str(disk().get("show_names")))
 
+    wp.scale.slider.setValue(120)
+    app.processEvents()
+    check(abs(disk().get("wheel_scale", 0) - 1.2) < 1e-6,
+          "整体大小写入", str(disk().get("wheel_scale")))
+    check(abs(sr.wheel_scale_of(wheel.cfg) - 1.2) < 1e-6,
+          "轮盘立刻读到新的大小（同一个 cfg 对象）")
+    wheel.show_wheel()
+    g2 = wheel.widget.geometry()
+    extent2 = sr.ring_layout(wheel.cfg, len(bank), sr.wheel_scale_of(wheel.cfg))["extent"]
+    check(abs(g2.width() - (extent2 * 2 + 48)) <= 2,
+          "整体调大后窗口跟着变大", f"{g2.width()}px")
+    wheel.hide_wheel()
+    wp.scale.slider.setValue(100)
+    app.processEvents()
+
     print("\n=== B. 轮盘页：手感 ===")
     wp.sensitivity.slider.setValue(150)
-    wp.deadzone.slider.setValue(40)
     wp.noise.slider.setValue(5)
     app.processEvents()
     d = disk()
     check(abs(d.get("sensitivity", 0) - 1.5) < 1e-6, "灵敏度写入", str(d.get("sensitivity")))
-    check(d.get("deadzone_px") == 40, "死区写入", str(d.get("deadzone_px")))
     check(d.get("noise_floor") == 5, "手抖过滤写入", str(d.get("noise_floor")))
-    # 死区/灵敏度是否真的被轮盘读取
-    check(wheel.cfg.get("deadzone_px") == 40, "轮盘读到新死区（同一个 cfg 对象）")
+    # 「中心死区」已经并进「中空比例」：判定阈值 = 画出来的中空半径
+    geo_now = sr.ring_layout(wheel.cfg, len(bank), sr.wheel_scale_of(wheel.cfg))
+    mid = geo_now["hole"] - 4.0
+    check(sr.index_from_delta(0, -mid, len(bank), 0, wheel.cfg,
+                              sr.wheel_scale_of(wheel.cfg)) is None,
+          "中空内不算选中（判定阈值就是中空半径）", f"hole={geo_now['hole']:.1f}")
+    check(wheel.cfg.get("deadzone_px") is None, "配置里不再保留 deadzone_px")
 
     print("\n=== C. 轮盘页：配色 ===")
     before = tuple(theme.ACCENT_RGB)

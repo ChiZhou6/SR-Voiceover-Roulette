@@ -370,6 +370,21 @@ def clamp_offset(x: float, y: float, limit: float) -> tuple[float, float]:
 OUTER_GAP = 0.0   # 内圈与外圈之间的缝。0 = 两圈紧贴成一整块（默认）
 
 
+def wheel_scale_of(cfg: dict) -> float:
+    """用户设的「整体大小」，1.0 = 100%。
+
+    这一层缩放乘在轮盘的每一个像素尺寸上（内圈半径、中空半径、外圈厚度、
+    字号、中心提示的行距……），所以它是"整体大小"，不是"内圈大小"。
+    设置窗口里调的时候所有判定和绘制都走同一个值，不会出现
+    "看着是这么大、选起来是那么大"。
+    """
+    try:
+        v = float(cfg.get("wheel_scale", 1.0) or 1.0)
+    except (TypeError, ValueError):
+        return 1.0
+    return max(0.5, min(2.0, v))
+
+
 def ring_layout(cfg: dict, count: int, scale: float = 1.0) -> dict:
     """算出轮盘每一层的半径范围与格数。
 
@@ -377,8 +392,8 @@ def ring_layout(cfg: dict, count: int, scale: float = 1.0) -> dict:
     第 9 个进来才长出外圈：内圈固定 8 格、外圈固定 12 个位置（30° 一格），
     已经编入的才画，空的格子不画。
 
-    scale 只给配置窗口的预览用：外圈一出现轮盘整体变大，
-    预览区放不下就整体等比缩放，比例和游戏里一致。
+    scale 是"最终缩放系数"，调用方自己把「整体大小」（wheel_scale_of）算进去：
+    游戏里直接传 wheel_scale_of(cfg)，配置窗口的预览再乘一个自适应的适配比例。
     """
     r_in = float(cfg["wheel_radius"]) * scale
     hole = r_in * float(cfg["inner_ratio"])
@@ -483,13 +498,20 @@ def index_from_delta(dx: float, dy: float, count: int, deadzone: float,
 
     0 号从正上方开始顺时针。距离决定内圈/外圈，角度决定是哪一格。
     outer_map 是外圈摆位表（位置 -> 音效下标），不传就按顺序从第 0 格排起。
+
+    ★ 中空区判定 = 画面上那块空白的半径（geo["hole"]），**不是** fixed 像素死区。
+    以前这里用的是 cfg["deadzone_px"]（默认 24px），而画出来的中空半径是
+    wheel_radius × inner_ratio（默认 180 × 0.42 ≈ 76px）——两个数毫无关系，
+    结果就是"光标还在白圈里、某一格已经亮了"，而且怎么调中空比例都不变。
+    现在唯一的口径是中空半径：中心留白多大，能"不选中"的范围就多大。
+    deadzone 参数只为兼容老调用方留着，已经不再参与判定。
     """
     if count <= 0:
         return None
     dist = math.hypot(dx, dy)
-    if dist < float(deadzone):
-        return None
     geo = ring_layout(cfg, count, scale)
+    if dist < float(geo["hole"]):
+        return None
     if geo["two_ring"] and dist >= geo["outer_r0"]:
         pos = sector_from_delta(dx, dy, OUTER_MAX, 0.0)
         if pos is None:
@@ -799,12 +821,14 @@ DEFAULT_CONFIG = {
     # 槽位上限：内圈 8 + 外圈 12。实际格子数 = 已编入轮盘的音效数
     "slots": MAX_SLOTS,
     "outer_thickness": 60,   # 外圈那条环的厚度(px)，只有出现外圈时才用得上
-    "deadzone_px": 24,       # v0.1 是 44，太大导致"划半天没反应"
     "sensitivity": 0.85,     # Raw Input 位移 → 虚拟光标位移的倍率
     "noise_floor": 2,        # 每次轮询位移不超过这个值视为手抖，丢弃
     "max_offset_ratio": 0.9,  # 虚拟光标最远能推到轮盘半径的多少
     "wheel_radius": 180,
     "inner_ratio": 0.42,
+    # 整体大小：1.0 = 100%。乘在轮盘的每一个像素尺寸上（内圈、中空、外圈厚度、
+    # 字号、中心提示），绘制与判定共用，所以放大缩小都不会"看着大、选着小"。
+    "wheel_scale": 1.0,
     # 轮盘弹出位置：screen = 固定屏幕正中（推荐），cursor = 跟随鼠标
     "wheel_anchor": "screen",
     "opacity": 0.94,
@@ -847,9 +871,9 @@ DEFAULT_CONFIG = {
 
 # 老版本没有这些手感参数，混用会让"手感差"的问题继续存在，所以只继承用户真正在意的项
 _CARRY_OVER_KEYS = (
-    "hotkey", "volume", "opacity", "show_names", "wheel_radius",
+    "hotkey", "volume", "opacity", "show_names", "wheel_radius", "wheel_scale",
     "hold_ms", "repeat_last_key", "cycle_key", "tap_action",
-    "sensitivity", "deadzone_px", "noise_floor",
+    "sensitivity", "noise_floor",
 )
 
 
@@ -3197,6 +3221,12 @@ class WheelWidget(QWidget):
             on_done()
             return
 
+        # 涨大必须留够窗口余量：窗口尺寸是"最外缘 ×2 + 48"，四周只有 24px 空地。
+        # 轮盘调大之后固定 5% 会溢出被裁，所以按当前实际半径算出可用的最大幅度。
+        count = len(self.bank) if self.bank is not None else 0
+        extent = ring_layout(self.cfg, count, self.paint_scale())["extent"]
+        grow_max = min(0.05, 16.0 / max(1.0, extent))
+
         a = QVariantAnimation(self)
         a.setStartValue(0.0)
         a.setEndValue(1.0)
@@ -3205,7 +3235,7 @@ class WheelWidget(QWidget):
 
         def on_tick(v) -> None:
             t = float(v)
-            self.anim_scale = 1.0 + 0.05 * t
+            self.anim_scale = 1.0 + grow_max * t
             self.anim_alpha = max(0.0, 1.0 - t * 1.15)
             self.update()
 
@@ -3239,6 +3269,12 @@ class WheelWidget(QWidget):
         self.anim_scale = 1.0
         self.anim_alpha = 1.0
 
+        # 和收起动画同理：窗口四周只有 24px 余量，按当前半径定涨大上限，
+        # 免得轮盘调到 140% 之后最外缘被窗口裁掉一条边。
+        count = len(self.bank) if self.bank is not None else 0
+        extent = ring_layout(self.cfg, count, self.paint_scale())["extent"]
+        grow_max = min(0.06, 18.0 / max(1.0, extent))
+
         a = QVariantAnimation(self)
         a.setStartValue(0.0)
         a.setEndValue(1.0)
@@ -3249,9 +3285,7 @@ class WheelWidget(QWidget):
         def on_tick(v) -> None:
             t = float(v)
             grow = 1.0 - (1.0 - t) ** 2      # 尺寸前快后慢，像"甩"出去
-            # 0.06：轮盘半径最大 280 + 外圈 60 = 340，窗口四周只留 24px 余量，
-            # 涨太多或加发光都会把最外缘切掉一点点
-            self.anim_scale = 1.0 + 0.06 * grow
+            self.anim_scale = 1.0 + grow_max * grow
             self.anim_alpha = max(0.0, 1.0 - t * t)   # 前段几乎不透明，后段才化掉
             self.update()
 
@@ -3271,11 +3305,23 @@ class WheelWidget(QWidget):
         self.update()            # 先把整盘擦掉，别等第一帧
         a.start()
 
+    def user_scale(self) -> float:
+        """「整体大小」那一项（1.0 = 100%）。"""
+        return wheel_scale_of(self.cfg)
+
+    def paint_scale(self) -> float:
+        """这一帧轮盘所有像素尺寸的总缩放：预览适配 × 用户整体大小。"""
+        return self.view_scale() * self.user_scale()
+
     def view_scale(self) -> float:
         """配置窗口里的预览要整体等比缩放。
 
         外圈一出现轮盘就变大（内圈尺寸不动），预览区放不下，
         所以按比例缩；游戏里的轮盘永远 1.0，所见即所得。
+
+        基准只按 100% 算，并且只占住预览区约 74%：剩下的空间留给
+        「整体大小」——否则把 user_scale 也算进 min(1, room/extent) 里，
+        滑块往右拖会被自适应原样压回去，看着像没生效。
         """
         if not getattr(self, "embedded", False):
             return 1.0
@@ -3284,7 +3330,7 @@ class WheelWidget(QWidget):
         room = min(self.width(), self.height()) / 2.0 - 14.0
         if extent <= 0 or room <= 0:
             return 1.0
-        return min(1.0, room / extent)
+        return min(1.0, room / extent) * 0.74
 
     def slot_pairs(self, geo: dict) -> list[tuple[int, int]]:
         """[(槽位号, 音效下标)]，按槽位号升序。外圈空着的位置不在里面。
@@ -3352,8 +3398,9 @@ class WheelWidget(QWidget):
         if not self.cfg.get("show_names", True):
             return
         selected = self.selected
+        s = max(0.55, self.paint_scale())
         font = QFont(UI_FONT)
-        font.setPointSize(9)
+        font.setPointSizeF(max(6.0, 9.0 * s))
         font.setWeight(QFont.DemiBold)
         p.setFont(font)
         fm = QFontMetrics(font)
@@ -3373,8 +3420,8 @@ class WheelWidget(QWidget):
             # 文字是水平排布的，除了受扇形弦长限制，还必须夹在轮盘的
             # 左右边缘以内。只有 2 个音效时扇区宽 180°，文字中心几乎
             # 贴着轮盘边缘，不夹住就会画出窗口被裁掉半截。
-            edge_room = min(tx - (cx - radius + 8.0), (cx + radius - 8.0) - tx)
-            label_w = max(28.0, min(tangent_w, max(0.0, edge_room) * 2.0))
+            edge_room = min(tx - (cx - radius + 8.0 * s), (cx + radius - 8.0 * s) - tx)
+            label_w = max(28.0 * s, min(tangent_w, max(0.0, edge_room) * 2.0))
             raw = self.bank.name_at(idx)
             text = fm.elidedText(raw, Qt.ElideRight, int(label_w))
             # 选中扇区是亮色填充，文字必须反过来用深色，否则糊成一片
@@ -3385,7 +3432,7 @@ class WheelWidget(QWidget):
             )
             p.setPen(QPen(color))
             p.drawText(
-                QRectF(tx - label_w / 2, ty - 9, label_w, 18),
+                QRectF(tx - label_w / 2, ty - 9 * s, label_w, 18 * s),
                 Qt.AlignCenter,
                 text,
             )
@@ -3405,13 +3452,14 @@ class WheelWidget(QWidget):
                 return
             r0, r1, start_deg, span = geom
             path = ring_sector_path(cx, cy, r0, r1, start_deg, span)
+            s = max(0.55, self.paint_scale())
             # 外发光：同一条路径先用粗半透明笔画一遍，边缘有一点溢出的感觉
             glow = accent_light(70)
             p.setBrush(Qt.NoBrush)
-            p.setPen(QPen(glow, 7.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            p.setPen(QPen(glow, 7.0 * s, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
             p.drawPath(path)
             p.setBrush(accent(240))
-            p.setPen(QPen(accent_light(255), 2.2))
+            p.setPen(QPen(accent_light(255), 2.2 * s))
             p.drawPath(path)
             self._paint_slot_names(p, cx, cy, geo, geo["extent"], only_idx=idx)
             return
@@ -3426,10 +3474,13 @@ class WheelWidget(QWidget):
         p.setRenderHint(QPainter.TextAntialiasing, True)
 
         count = len(self.bank)
-        scale = self.view_scale()
+        # 「整体大小」乘在预览适配比例上：所有半径、厚度、字号都吃这一个值，
+        # 判定那边用 wheel_scale_of() 拿到同一个数，两边永远对得上。
+        scale = self.paint_scale()
         geo = ring_layout(cfg, count, scale)
         radius = geo["extent"]
         inner = geo["hole"]
+        s = max(0.55, scale)          # 像素常量（行距、光点、描边）统一跟着缩
         n = max(1, count)
         selected = self.selected
 
@@ -3446,7 +3497,7 @@ class WheelWidget(QWidget):
             p.setBrush(Qt.NoBrush)
             p.drawEllipse(QRectF(cx - radius, cy - radius, radius * 2, radius * 2))
             f = QFont(UI_FONT)
-            f.setPointSize(10)
+            f.setPointSizeF(max(6.0, 10.0 * s))
             p.setFont(f)
             p.setPen(QPen(QColor(150, 158, 172, 235)))
             p.drawText(
@@ -3472,12 +3523,12 @@ class WheelWidget(QWidget):
                 fill = QColor(22, 24, 31, int(215 * opacity))
                 border = QColor(122, 128, 142, 200)
             p.setBrush(fill)
-            p.setPen(QPen(border, 1.2 if idx != selected else 2.0))
+            p.setPen(QPen(border, (1.2 if idx != selected else 2.0) * s))
             p.drawPath(path)
 
         # 中心圆：和普通格子用同一套填充/描边，不然中间会像塌下去一块黑。
         p.setBrush(QColor(22, 24, 31, int(215 * opacity)))
-        p.setPen(QPen(QColor(122, 128, 142, 200), 1.2))
+        p.setPen(QPen(QColor(122, 128, 142, 200), 1.2 * s))
         p.drawEllipse(QRectF(cx - inner, cy - inner, inner * 2, inner * 2))
 
         # 扇区文字（内圈外圈各一遍，位置都由 slot_geometry 决定）
@@ -3485,7 +3536,7 @@ class WheelWidget(QWidget):
 
         # 中心提示
         f1 = QFont(UI_FONT)
-        f1.setPointSize(10)
+        f1.setPointSizeF(max(6.0, 10.0 * s))
         f1.setWeight(QFont.DemiBold)
         p.setFont(f1)
         p.setPen(QPen(QColor(238, 240, 246, 240)))
@@ -3518,26 +3569,33 @@ class WheelWidget(QWidget):
                 self.bank.name_at(selected), Qt.ElideRight, int(inner * 1.6)
             )
             sub_hint = "松开播放"
-        p.drawText(QRectF(cx - inner, cy - 38, inner * 2, 22), Qt.AlignCenter, main_hint)
+        p.drawText(
+            QRectF(cx - inner, cy - 38 * s, inner * 2, 22 * s),
+            Qt.AlignCenter, main_hint,
+        )
 
         f2 = QFont(UI_FONT)
-        f2.setPointSize(8)
+        f2.setPointSizeF(max(5.5, 8.0 * s))
         p.setFont(f2)
         p.setPen(QPen(QColor(152, 158, 172, 225)))
-        p.drawText(QRectF(cx - inner, cy + 14, inner * 2, 18), Qt.AlignCenter, sub_hint)
+        p.drawText(
+            QRectF(cx - inner, cy + 14 * s, inner * 2, 18 * s),
+            Qt.AlignCenter, sub_hint,
+        )
 
         # 虚拟光标：这是"你手当前指哪儿"的唯一可视化，让所见即所选
         dotx = cx + self.vx
         doty = cy + self.vy
         dist = math.hypot(self.vx, self.vy)
-        # 只有真的推离中心才发光晕；停在中心时发光会盖住上面的提示文字
-        if dist > float(cfg.get("deadzone_px", 24)):
-            glow = QRadialGradient(QPointF(dotx, doty), 20.0)
+        # 只有真的推离中空区才发光晕；停在中心时发光会盖住上面的提示文字。
+        # 阈值和判定同一个口径（中空半径），光标一离开白圈就有反馈。
+        if dist > inner:
+            glow = QRadialGradient(QPointF(dotx, doty), 20.0 * s)
             glow.setColorAt(0.0, accent_light(170))
             glow.setColorAt(1.0, accent(0))
             p.setBrush(glow)
             p.setPen(Qt.NoPen)
-            p.drawEllipse(QPointF(dotx, doty), 20.0, 20.0)
+            p.drawEllipse(QPointF(dotx, doty), 20.0 * s, 20.0 * s)
 
         # 选中态用浅色实心 + 深绿描边，在高亮扇区上也能一眼看见
         if selected is not None:
@@ -3546,13 +3604,13 @@ class WheelWidget(QWidget):
         else:
             p.setBrush(QColor(210, 214, 224, 235))
             p.setPen(QPen(QColor(255, 255, 255, 235), 2.0))
-        p.drawEllipse(QPointF(dotx, doty), 7.0, 7.0)
+        p.drawEllipse(QPointF(dotx, doty), 7.0 * s, 7.0 * s)
 
         # 从内圈外缘到光标的一条指示线，帮助看清当前指向。
         # 必须从内圈边缘起画，否则会横穿中心文字，把提示糊成一条划线。
         if dist > inner * 0.95:
             ux, uy = self.vx / dist, self.vy / dist
-            p.setPen(QPen(accent(150), 2.0, Qt.DashLine))
+            p.setPen(QPen(accent(150), 2.0 * s, Qt.DashLine))
             p.drawLine(
                 QPointF(cx + ux * inner * 0.95, cy + uy * inner * 0.95),
                 QPointF(dotx, doty),
@@ -3632,7 +3690,19 @@ class WheelSwitchWidget(QWidget):
         }
 
     def radius(self) -> float:
-        return float(self.cfg.get("wheel_radius", 180)) * 0.86
+        return (
+            float(self.cfg.get("wheel_radius", 180))
+            * 0.86
+            * wheel_scale_of(self.cfg)
+        )
+
+    def hole_radius(self) -> float:
+        """中空半径 = 画出来那个中心圆。
+
+        选中判定必须用它，不能再用固定像素死区：以前这里是 24px，
+        而画出来的白圈半径有 70 多，手感就是"手还在中间、格子已经亮了"。
+        """
+        return self.radius() * 0.50
 
     def apply_style(self) -> None:
         if getattr(self, "embedded", False):
@@ -3647,16 +3717,19 @@ class WheelSwitchWidget(QWidget):
 
     def slot_geom(self, k: int, n: int) -> tuple[float, float, float, float]:
         radius = self.radius()
-        inner = radius * 0.50
+        inner = self.hole_radius()
         span = 360.0 / max(1, n)
         return inner, radius, 90.0 - k * span, span
 
     def paintEvent(self, event) -> None:  # noqa: N802
         cx, cy = self.width() / 2.0, self.height() / 2.0
         radius = self.radius()
-        inner = radius * 0.50
+        inner = self.hole_radius()
         n = len(self.entries)
         opacity = float(self.cfg.get("opacity", 0.94))
+        # 「整体大小」也管这个选择器：半径变了，字号和线宽得跟着变，
+        # 不然 140% 时字显得特别小、70% 时又糊成一团
+        ws = wheel_scale_of(self.cfg)
 
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
@@ -3670,7 +3743,7 @@ class WheelSwitchWidget(QWidget):
             return
 
         font = QFont(UI_FONT)
-        font.setPointSize(9)
+        font.setPointSizeF(max(6.0, 9.0 * ws))
         font.setWeight(QFont.DemiBold)
         p.setFont(font)
         fm = QFontMetrics(font)
@@ -3712,8 +3785,8 @@ class WheelSwitchWidget(QWidget):
             rad = math.radians(start_deg - span / 2.0)
             tx = cx + tr * math.cos(rad)
             ty = cy - tr * math.sin(rad)
-            edge = min(tx - (cx - radius + 8.0), (cx + radius - 8.0) - tx)
-            label_w = max(28.0, min(tangent_w, max(0.0, edge) * 2.0))
+            edge = min(tx - (cx - radius + 8.0 * ws), (cx + radius - 8.0 * ws) - tx)
+            label_w = max(28.0 * ws, min(tangent_w, max(0.0, edge) * 2.0))
             text = fm.elidedText(name, Qt.ElideRight, int(label_w))
             if is_sel:
                 text_color = own.get("text") if own else (
@@ -3723,16 +3796,16 @@ class WheelSwitchWidget(QWidget):
             else:
                 text_color = QColor(214, 218, 228, 240)
             p.setPen(QPen(text_color))
-            p.drawText(QRectF(tx - label_w / 2.0, ty - 10, label_w, 20),
+            p.drawText(QRectF(tx - label_w / 2.0, ty - 10 * ws, label_w, 20 * ws),
                        Qt.AlignCenter, text)
 
         # 中心圆
         p.setBrush(QColor(22, 24, 31, int(215 * opacity)))
-        p.setPen(QPen(QColor(122, 128, 142, 200), 1.2))
+        p.setPen(QPen(QColor(122, 128, 142, 200), 1.2 * ws))
         p.drawEllipse(QRectF(cx - inner, cy - inner, inner * 2, inner * 2))
 
         f1 = QFont(UI_FONT)
-        f1.setPointSize(9)
+        f1.setPointSizeF(max(6.0, 9.0 * ws))
         p.setFont(f1)
         fm1 = QFontMetrics(f1)
         if self.selected is None:
@@ -3746,22 +3819,22 @@ class WheelSwitchWidget(QWidget):
             # 中心文字跟着瞄中的那套走：深色内圆上用它提亮过的那一档，保证看得清
             main_color = sel_own.get("light") or QColor(226, 230, 238, 245)
         p.setPen(QPen(main_color))
-        p.drawText(QRectF(cx - inner, cy - 20, inner * 2, 20), Qt.AlignCenter, main)
+        p.drawText(QRectF(cx - inner, cy - 20 * ws, inner * 2, 20 * ws), Qt.AlignCenter, main)
         f2 = QFont(UI_FONT)
-        f2.setPointSize(8)
+        f2.setPointSizeF(max(5.5, 8.0 * ws))
         p.setFont(f2)
         p.setPen(QPen(QColor(152, 158, 172, 225)))
-        p.drawText(QRectF(cx - inner, cy + 4, inner * 2, 18), Qt.AlignCenter, sub)
+        p.drawText(QRectF(cx - inner, cy + 4 * ws, inner * 2, 18 * ws), Qt.AlignCenter, sub)
 
         # 虚拟光标：白心 + 瞄中那套的深色描边（没瞄中就是主题色）
         dotx, doty = cx + self.vx, cy + self.vy
         if self.selected is not None:
             p.setBrush(QColor(234, 255, 243, 255))
-            p.setPen(QPen(sel_own["dark"] if sel_own else accent_dark(255), 2.0))
+            p.setPen(QPen(sel_own["dark"] if sel_own else accent_dark(255), 2.0 * ws))
         else:
             p.setBrush(QColor(210, 214, 224, 235))
-            p.setPen(QPen(QColor(255, 255, 255, 235), 2.0))
-        p.drawEllipse(QPointF(dotx, doty), 6.0, 6.0)
+            p.setPen(QPen(QColor(255, 255, 255, 235), 2.0 * ws))
+        p.drawEllipse(QPointF(dotx, doty), 6.0 * ws, 6.0 * ws)
         p.end()
 
 
@@ -3854,7 +3927,8 @@ class WheelSwitchController(QObject):
             dx = dy = 0.0
 
         n = len(self.widget.entries)
-        idx = sector_from_delta(self.vx, self.vy, n, float(cfg.get("deadzone_px", 24)))
+        # 中心区判定跟着画出来的中空圆走（不再是固定 24px 死区）
+        idx = sector_from_delta(self.vx, self.vy, n, self.widget.hole_radius())
         # 只要光标动了就重画，别等"跨过扇区"才画一次：
         # 之前那样光标在同一个扇区里移动时画面是冻住的，跨线才跳一下，
         # 用手推的时候就是一顿一顿的。主轮盘一直是"动了就画"，两边现在一致了。
@@ -3927,8 +4001,10 @@ class PauseToast(QWidget):
         geo = screen.geometry() if screen else None
         if geo is not None:
             x = geo.center().x() - self.width() // 2
-            # 略高于屏幕正中：轮盘弹出来时中心是空的，两边不会打架
-            y = geo.center().y() - self.height() // 2 - 40
+            # 屏幕自上往下 3/4 的位置：正中间是玩家盯得最紧的区域（准星附近），
+            # 之前画在正中偏上，一暂停就像被人贴了张膏药。挪到下面这条"视线边缘"，
+            # 余光能看见，又不压住任何要害。
+            y = geo.top() + int(geo.height() * 0.75) - self.height() // 2
             self.setGeometry(x, y, self.width(), self.height())
 
         if self._anim is not None:
@@ -3975,7 +4051,10 @@ class PauseToast(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
         p.setRenderHint(QPainter.TextAntialiasing, True)
-        p.setOpacity(min(1.0, alpha))
+        # 和轮盘同款透明度：轮盘「不透明度」调到多少，这条提示就透到多少。
+        # 以前这里恒定 240/255，设成 40% 也只是轮盘半透明、提示照样一块实心板。
+        ui_opacity = float(self.cfg.get("opacity", 0.94) or 0.94)
+        p.setOpacity(max(0.05, min(1.0, alpha * ui_opacity)))
 
         cx, cy = self.width() / 2.0, self.height() / 2.0
         scale = 0.90 + 0.10 * appear
@@ -4075,7 +4154,9 @@ class WheelController(QObject):
         self.raw.drop()  # 丢掉打开前的残余位移，保证从正中起步
 
         # 外圈出现后轮盘变大，窗口尺寸按"最外缘"算，不是按内圈半径
-        extent = ring_layout(self.cfg, len(self.bank), 1.0)["extent"]
+        extent = ring_layout(
+            self.cfg, len(self.bank), wheel_scale_of(self.cfg)
+        )["extent"]
         size = int(extent * 2 + 48)
         size += size % 2  # 边长取偶数：奇数时绘制中心会落在半像素上，导致轻微偏移
         half = size // 2
@@ -4143,6 +4224,8 @@ class WheelController(QObject):
         cfg = self.cfg
         dx, dy = self.raw.take()
         omap = outer_index_map_of(self.bank)
+        # 整体大小：绘制、限位、判定三处必须吃同一个缩放，否则又会"看着大、选着小"
+        ws = wheel_scale_of(cfg)
         # 噪声门限：玩家手搭在鼠标上时，静止状态也会持续报 1~2 mickey 的微动，
         # 不滤掉的话虚拟光标会缓慢自己漂到别的扇区去。
         if abs(dx) + abs(dy) > float(cfg.get("noise_floor", 2)):
@@ -4150,13 +4233,14 @@ class WheelController(QObject):
             prev = (self.vx, self.vy)      # 墙在哪儿要看上一帧站的位置
             self.vx += dx * sens
             self.vy += dy * sens
-            limit = ring_layout(cfg, len(self.bank), 1.0)["extent"] * float(
+            limit = ring_layout(cfg, len(self.bank), ws)["extent"] * float(
                 cfg.get("max_offset_ratio", 0.9)
             )
             self.vx, self.vy = clamp_offset(self.vx, self.vy, limit)
             # 外圈有空位时不能把光标推进空白格，也不许跨过空白去够远处的格子
             self.vx, self.vy = clamp_to_filled(
-                self.vx, self.vy, cfg, len(self.bank), outer_map=omap, prev=prev
+                self.vx, self.vy, cfg, len(self.bank), ws,
+                outer_map=omap, prev=prev
             )
             self.widget.vx = self.vx
             self.widget.vy = self.vy
@@ -4164,7 +4248,7 @@ class WheelController(QObject):
             dx = dy = 0.0
 
         idx = index_from_delta(
-            self.vx, self.vy, len(self.bank), float(cfg["deadzone_px"]), cfg,
+            self.vx, self.vy, len(self.bank), 0.0, cfg, ws,
             outer_map=omap,
         )
 

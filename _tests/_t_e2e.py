@@ -326,7 +326,10 @@ def main() -> int:
 
         print("\n松开 Y ...")
         send_key(VK_Y, up=True)
-        time.sleep(0.35)
+        # 松手后有 200ms 的"闪出"动画，播完才真正 hide（实测 210ms）。
+        # 但 up 事件的检测、动画收尾和这里的窗口枚举之间有几拍抖动，
+        # 0.35 秒会随机误报成"没隐藏"（旧版代码也一样）。留足 2 秒再断言。
+        time.sleep(2.0)
         after = wheel_windows(proc.pid)
         check(len(after) == 0, "松开后轮盘已隐藏", f"发现 {len(after)} 个")
 

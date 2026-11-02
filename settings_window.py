@@ -2701,11 +2701,20 @@ class WheelPage(QWidget):
         card, lay = _card("外观")
 
         self.radius = self._slider(int(cfg.get("wheel_radius", 180)), 120, 280, " px")
-        lay.addWidget(_row("直径", self.radius, ""))
+        lay.addWidget(_row("直径", self.radius, "内圈的直径"))
         self.inner = self._slider(int(float(cfg.get("inner_ratio", 0.42)) * 100), 25, 70, " %")
-        lay.addWidget(_row("中空比例", self.inner, ""))
+        lay.addWidget(_row("中空比例", self.inner, "中心留白，也是「不选中」的范围"))
+        # 整体大小：内圈、中空、外圈厚度、扇区文字、中心提示一起等比缩放。
+        # 和上面「直径」是叠加关系：直径决定基准尺寸，这一项决定整体放大多少。
+        self.scale = self._slider(int(float(cfg.get("wheel_scale", 1.0)) * 100), 70, 140, " %")
+        self.scale.setToolTip(
+            "整个轮盘等比放大/缩小：内圈、外圈厚度、扇区上的文字、中心提示\n"
+            "会一起变，选中判定的范围也跟着变，不会出现「看着大、选着小」。\n"
+            "100% 是标准大小；屏幕小就用小一点，4K 屏看不清可以调大。"
+        )
+        lay.addWidget(_row("整体大小", self.scale, "内外圈和文字一起缩放"))
         self.opacity = self._slider(int(float(cfg.get("opacity", 0.94)) * 100), 40, 100, " %")
-        lay.addWidget(_row("不透明度", self.opacity, ""))
+        lay.addWidget(_row("不透明度", self.opacity, "暂停提示也用这个值"))
         # 内圈装满 8 个之后轮盘外面会再长一圈，这一项控制那一圈的厚度。
         # 内圈尺寸不受影响，所以"直径"仍然是内圈的直径。
         self.outer_thick = self._slider(
@@ -2818,15 +2827,21 @@ class WheelPage(QWidget):
         card2, lay2 = _card("手感")
         self.sensitivity = self._slider(int(float(cfg.get("sensitivity", 0.85)) * 100), 30, 200, " %")
         lay2.addWidget(_row("鼠标灵敏度", self.sensitivity, ""))
-        self.deadzone = self._slider(int(cfg.get("deadzone_px", 24)), 8, 80, " px")
-        lay2.addWidget(_row("中心死区", self.deadzone, ""))
         self.noise = self._slider(int(cfg.get("noise_floor", 2)), 0, 8, "")
         lay2.addWidget(_row("手抖过滤", self.noise, "越大越稳，但越迟钝"))
+        hint_dz = QLabel(
+            "中心那块白圈就是「不选中」的范围，由上面「中空比例」决定——"
+            "想让它更灵敏就把中空比例调小。以前另有一个独立的「死区」滑块，"
+            "和画面对不上（手还在中间、格子已经亮了），已经并进中空比例。"
+        )
+        hint_dz.setObjectName("Hint")
+        hint_dz.setWordWrap(True)
+        lay2.addWidget(hint_dz)
         root.addWidget(card2)
         root.addStretch(1)
 
-        for w in (self.radius, self.inner, self.opacity, self.outer_thick,
-                  self.sensitivity, self.deadzone, self.noise):
+        for w in (self.radius, self.inner, self.scale, self.opacity, self.outer_thick,
+                  self.sensitivity, self.noise):
             w.slider.valueChanged.connect(self._push)
         self.chk_names.toggled.connect(self._push)
         self.chk_anim.toggled.connect(self._push)
@@ -3059,12 +3074,12 @@ class WheelPage(QWidget):
     def _push(self) -> None:
         self.cfg["wheel_radius"] = int(self.radius.slider.value())
         self.cfg["inner_ratio"] = self.inner.slider.value() / 100.0
+        self.cfg["wheel_scale"] = self.scale.slider.value() / 100.0
         self.cfg["opacity"] = self.opacity.slider.value() / 100.0
         self.cfg["outer_thickness"] = int(self.outer_thick.slider.value())
         self.cfg["show_names"] = bool(self.chk_names.isChecked())
         self.cfg["animations"] = bool(self.chk_anim.isChecked())
         self.cfg["sensitivity"] = self.sensitivity.slider.value() / 100.0
-        self.cfg["deadzone_px"] = int(self.deadzone.slider.value())
         self.cfg["noise_floor"] = int(self.noise.slider.value())
         self.changed.emit()
 
@@ -3912,8 +3927,12 @@ class WheelPreview(sr.WheelWidget):
         return ""
 
     def ring_geometry(self) -> tuple[dict, float]:
-        """当前预览的环布局 + 缩放比（外圈出现时预览整体缩小）。"""
-        scale = self.view_scale()
+        """当前预览的环布局 + 缩放比（预览适配 × 「整体大小」）。
+
+        必须和 _paint_body 用同一个系数：以前这里只取 view_scale()，
+        绘制那边却把「整体大小」也乘了进去，预览里的点选/拖放就会整体偏一圈。
+        """
+        scale = self.paint_scale()
         return sr.ring_layout(self.cfg, self.count(), scale), scale
 
     def _to_world(self, pos: QPoint) -> tuple[float, float]:
@@ -4779,6 +4798,9 @@ class SettingsWindow(QWidget):
         self.preview_cfg["opacity"] = cfg["opacity"]
         self.preview_cfg["outer_thickness"] = cfg["outer_thickness"]
         self.preview_cfg["show_names"] = cfg["show_names"]
+        # 「整体大小」原样传下去：预览的 view_scale() 里留了 26% 余量，
+        # 70%~140% 都能在预览框里真的变大变小，而不是被自适应压回去
+        self.preview_cfg["wheel_scale"] = float(cfg.get("wheel_scale", 1.0) or 1.0)
         # 预览半径按比例缩放，跟着真实半径走但始终放得下
         r = int(float(cfg["wheel_radius"]) * 172.0 / 180.0)
         r = max(90, min(200, r))
