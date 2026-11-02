@@ -1,4 +1,4 @@
-"""SR Voiceover Roulette - 三角洲行动音效轮盘
+"""SR Voiceover Roulette - 游戏内音效轮盘
 
 v0.2.0 的两处重做：
   1. 输入：不再读光标绝对位置（游戏把光标钉在准星，读到的永远是常量）。
