@@ -18,7 +18,7 @@ import re
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
-CONFIG_VERSION = 3
+CONFIG_VERSION = 4
 
 # 最多能存几套轮盘（含当前正在用的那套）
 MAX_WHEELS = 8
@@ -67,6 +67,64 @@ SPEED_MODE_LABEL = {
 }
 
 
+# ---------------------------------------------------------------- 触发方式
+#
+# v0.9 新增：快捷键按下去之后，到底"什么时候响、什么时候停"。
+# 以前只有一种行为（按下响一次），现在由每个音效自己挑：
+#
+#   tap     点击触发（默认，和以前完全一致）：按下响一次，松手不管
+#   hold    长按触发：按下开始响，松手立刻停（下次按从头开始）
+#   release 松手触发：按下什么都不做，松手的那一下才响
+#   repeat  长按连续触发：按下响一次，之后每 N 毫秒再"虚拟点一次"，
+#           用来驱动连击变调/变速（按得越久，音越连）
+
+TRIGGER_TAP = "tap"
+TRIGGER_HOLD = "hold"
+TRIGGER_RELEASE = "release"
+TRIGGER_REPEAT = "repeat"
+TRIGGER_MODES = (TRIGGER_TAP, TRIGGER_HOLD, TRIGGER_RELEASE, TRIGGER_REPEAT)
+
+TRIGGER_MODE_LABEL = {
+    TRIGGER_TAP: "点击触发",
+    TRIGGER_HOLD: "长按触发",
+    TRIGGER_RELEASE: "松手触发",
+    TRIGGER_REPEAT: "长按连续触发",
+}
+
+TRIGGER_MODE_TIP = {
+    TRIGGER_TAP: "按下快捷键立刻响一次，松手不停。",
+    TRIGGER_HOLD: "按住时一直响，松手立刻停；下次再按会从头开始。",
+    TRIGGER_RELEASE: "按下时不出声，松手的那一刻才响。",
+    TRIGGER_REPEAT: "按下响一次，按住不放则每隔一段时间再响一次，\n"
+                    "相当于用手连续点这个键（连击变调/变速会跟着累加）。",
+}
+
+# 长按连续触发的间隔：50ms（每秒 20 次，已经很糊）~ 2000ms（每 2 秒一次）
+REPEAT_MS_MIN = 50
+REPEAT_MS_MAX = 2000
+
+# ---------------------------------------------------------------- 触发条件
+#
+# 音效默认"无条件"，按了就能响。设成"条件解锁"之后，必须先按一下解锁键，
+# 这个音效才在"解锁时间"内、"解锁次数"内可以被触发。
+#
+# 注意两件事：
+#   1. 解锁时间只管"能不能再触发新的"，时间到了**不会**掐断正在响的声音
+#   2. 解锁次数 0 = 不限；长按连续触发整段按住只算 1 次
+
+UNLOCK_NONE = "none"
+UNLOCK_KEY = "key"
+UNLOCK_MODES = (UNLOCK_NONE, UNLOCK_KEY)
+
+UNLOCK_MODE_LABEL = {
+    UNLOCK_NONE: "无条件",
+    UNLOCK_KEY: "条件解锁",
+}
+
+UNLOCK_MS_MAX = 600000      # 解锁时间上限 10 分钟
+UNLOCK_COUNT_MAX = 999      # 解锁次数上限
+
+
 @dataclass
 class SoundSetting:
     """单个音效的独立参数。默认值 = 和以前完全一样的行为。"""
@@ -85,6 +143,17 @@ class SoundSetting:
     speed_step: float = 0.10       # 每次连击快/慢多少，0.10 = 10%
     speed_limit: float = 0.60      # 最多累计到多少，0.6 = 快 60% 或慢 60%
     hotkey: str = ""               # 直接触发键，空表示不绑定
+    # 全局通用：这个快捷键不再跟着轮盘走，切到任何一套轮盘都能按响。
+    # 关着的时候（默认）快捷键只在这一套轮盘上生效，和以前完全一样。
+    global_hotkey: bool = False
+
+    # ---- v0.9 新增 ----
+    trigger_mode: str = TRIGGER_TAP   # 按下/长按/松手/长按连发
+    repeat_ms: int = 200              # 长按连续触发的间隔（毫秒）
+    unlock_mode: str = UNLOCK_NONE    # 无条件 / 条件解锁
+    unlock_key: str = ""              # 解锁键，空 = 没设（等同于无条件）
+    unlock_ms: int = 0                # 解锁有效期，0 = 不限时（直到把次数用完）
+    unlock_count: int = 0             # 可用次数，0 = 不限次
 
     def clamped(self) -> "SoundSetting":
         """把越界的值收回来。手改 json 写错了也不至于出怪声。"""
@@ -102,6 +171,15 @@ class SoundSetting:
         s.speed_step = max(0.0, min(0.40, float(s.speed_step)))
         s.speed_limit = max(0.0, min(0.80, float(s.speed_limit)))
         s.hotkey = (s.hotkey or "").strip().lower()
+        s.global_hotkey = bool(s.global_hotkey)
+        if s.trigger_mode not in TRIGGER_MODES:
+            s.trigger_mode = TRIGGER_TAP
+        s.repeat_ms = max(REPEAT_MS_MIN, min(REPEAT_MS_MAX, int(s.repeat_ms)))
+        if s.unlock_mode not in UNLOCK_MODES:
+            s.unlock_mode = UNLOCK_NONE
+        s.unlock_key = (s.unlock_key or "").strip().lower()
+        s.unlock_ms = max(0, min(UNLOCK_MS_MAX, int(s.unlock_ms)))
+        s.unlock_count = max(0, min(UNLOCK_COUNT_MAX, int(s.unlock_count)))
         return s
 
 
@@ -1049,23 +1127,132 @@ class SoundsConfig:
         """组合在轮盘上的参数（音量/快捷键），和普通音效共用一套字典。"""
         return self.setting(self.combo_key(cid))
 
-    def hotkey_map(self) -> dict[str, str]:
-        """返回 {按键: order 里的键}，用于直接触发。组合键原样返回。
+    def hotkey_groups(self) -> dict[str, list[str]]:
+        """返回 {按键: [order 里的键, ...]}，用于直接触发。
+
+        v0.9 起一个键可以挂**多个**音效：像"长按左键播 AAA、松手左键播 B"
+        这种玩法，本来就是两个音效共用同一个键，各自按自己的触发方式响应。
+        以前是一对一（谁后设谁生效），做不到这个。
 
         组合的专属热键不必先把组合拖到轮盘上才能用：轮盘只有 20 格，
         而"某条组合单独绑一个键"本身就是不占格子的用法，所以这里把
         没上盘、但设了热键的组合也一并登记。
         """
-        out: dict[str, str] = {}
+        out: dict[str, list[str]] = {}
+
+        def _add(name: str) -> None:
+            hk = (self.setting(name).hotkey or "").strip().lower()
+            if not hk:
+                return
+            bucket = out.setdefault(hk, [])
+            if name not in bucket:
+                bucket.append(name)
+
         for name in self.order:
-            hk = self.setting(name).hotkey
-            if hk:
-                out.setdefault(hk, name)
-        for cid, c in self.combos.items():
+            _add(name)
+        for cid in self.combos:
             key = self.combo_key(cid)
-            if key in self.order:
-                continue      # 已经在上面处理过了，别重复占一个键
-            hk = self.setting(key).hotkey
-            if hk:
-                out.setdefault(hk, key)
+            if key not in self.order:
+                _add(key)          # 已经在上面处理过了，别重复占一个键
+        return out
+
+    def hotkey_map(self) -> dict[str, str]:
+        """兼容旧调用：{按键: 第一个绑这个键的音效}。
+
+        新代码请用 hotkey_groups()，那个才是完整信息。
+        """
+        return {k: v[0] for k, v in self.hotkey_groups().items() if v}
+
+    def global_hotkey_groups(self) -> dict[str, list[str]]:
+        """{按键: [音效键, ...]}：勾了「全局通用」的音效，跨所有轮盘收集。
+
+        和 hotkey_groups() 的区别是它**不看当前轮盘**：只要某个音效在它
+        所在的那套轮盘里勾了全局通用，切到别的轮盘照样能按响。
+        两边合起来用（轮盘内的 + 全局的），按键轮询那边再去重。
+        """
+        out: dict[str, list[str]] = {}
+        for w in self.wheels:
+            for key, st in (w.items or {}).items():
+                if not getattr(st, "global_hotkey", False):
+                    continue
+                hk = (st.hotkey or "").strip().lower()
+                if not hk:
+                    continue          # 勾了全局却没绑键：没有意义，别占位
+                bucket = out.setdefault(hk, [])
+                if key not in bucket:
+                    bucket.append(key)
+        return out
+
+    def global_names(self) -> list[str]:
+        """所有勾了全局通用、且绑了键的音效键（去重，保持稳定顺序）。
+
+        音频引擎拿它来决定"要不要为不在当前轮盘上的音效额外准备一份波形"。
+        """
+        seen: list[str] = []
+        for key, st in self._items_all_wheels():
+            if not getattr(st, "global_hotkey", False):
+                continue
+            if not (st.hotkey or "").strip():
+                continue
+            if key not in seen:
+                seen.append(key)
+        return seen
+
+    def _items_all_wheels(self):
+        """按"当前轮盘优先"的顺序遍历所有轮盘的 items，带轮盘 id。"""
+        cur = self.cur_wheel()
+        yield from cur.items.items()
+        for w in self.wheels:
+            if w.wid != cur.wid:
+                yield from (w.items or {}).items()
+
+    def setting_any(self, name: str) -> SoundSetting:
+        """取音效参数，但不限于当前轮盘。
+
+        快捷键可能来自"另一套轮盘里的全局音效"，那时当前轮盘的 items 里
+        根本没有这条记录；如果直接走 setting()，会凭空造一份默认值出来，
+        音量、变调、长按方式全部变成默认，听起来像设置丢了。
+
+        优先级：当前轮盘有就用当前轮盘的（切过去之后按那套轮盘的参数走），
+        否则找勾了全局通用那一套轮盘的原始参数。
+        """
+        key = self.canon(name)
+        cur = self.cur_wheel()
+        st = cur.items.get(key)
+        if st is not None:
+            return st
+        for w in self.wheels:
+            if w.wid == cur.wid:
+                continue
+            other = (w.items or {}).get(key)
+            if other is not None and getattr(other, "global_hotkey", False):
+                return other
+        st = SoundSetting()
+        cur.items[key] = st
+        return st
+
+    def unlock_groups(self) -> dict[str, list[str]]:
+        """返回 {解锁键: [音效键, ...]}。
+
+        同一个解锁键按一下，会把名下所有音效一起解锁（各自按自己的
+        解锁时间/次数算），所以 G 一次能同时放开 AAA 和 B。
+
+        勾了「全局通用」的音效也算进来：它们可能在别的轮盘上，参数得用
+        setting_any() 取，否则会读到当前轮盘凭空造出来的默认值（无条件），
+        解锁键就白设了。
+        """
+        out: dict[str, list[str]] = {}
+        groups = list(self.hotkey_groups().values())
+        groups += list(self.global_hotkey_groups().values())
+        for names in groups:
+            for name in names:
+                st = self.setting_any(name)
+                if st.unlock_mode != UNLOCK_KEY:
+                    continue
+                key = (st.unlock_key or "").strip().lower()
+                if not key:
+                    continue      # 选了条件解锁却没设键：当作无条件，别把人锁死
+                bucket = out.setdefault(key, [])
+                if name not in bucket:
+                    bucket.append(name)
         return out

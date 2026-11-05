@@ -87,6 +87,8 @@ from sounds_config import (
     PITCH_MODES,
     PITCH_NONE,
     PITCH_RANDOM,
+    REPEAT_MS_MAX,
+    REPEAT_MS_MIN,
     SPEED_MODE_LABEL,
     SPEED_MODES,
     SPEED_NONE,
@@ -94,6 +96,16 @@ from sounds_config import (
     TRIG_LABEL,
     TRIG_PREV_END,
     TRIGS,
+    TRIGGER_HOLD,
+    TRIGGER_MODE_LABEL,
+    TRIGGER_MODE_TIP,
+    TRIGGER_MODES,
+    TRIGGER_REPEAT,
+    UNLOCK_COUNT_MAX,
+    UNLOCK_KEY,
+    UNLOCK_MODE_LABEL,
+    UNLOCK_MODES,
+    UNLOCK_MS_MAX,
     is_combo_key,
 )
 import theme
@@ -392,6 +404,24 @@ QCheckBox::indicator {{
     background: #171a21;
 }}
 QCheckBox::indicator:checked {{
+    background: {ACCENT_HEX};
+    border-color: {ACCENT_HEX};
+}}
+/* 音效卡片里「快捷键」右边那个小勾选框：那一行本来就排满了，
+   用紧凑一档，免得把按键框挤扁 */
+QCheckBox#GlobalChk {{
+    color: #c8cddb;
+    font-size: 11px;
+    spacing: 4px;
+}}
+QCheckBox#GlobalChk::indicator {{
+    width: 13px;
+    height: 13px;
+    border-radius: 3px;
+    border: 1px solid #3a414f;
+    background: #171a21;
+}}
+QCheckBox#GlobalChk::indicator:checked {{
     background: {ACCENT_HEX};
     border-color: {ACCENT_HEX};
 }}
@@ -2564,7 +2594,10 @@ class HotkeyPage(QWidget):
         card3, l3 = _card("音效直按键")
         hint = QLabel(
             "每个音效可以单独绑一个键，按下直接播放，不用开轮盘。\n"
-            "在右下角那张音效卡片的「快捷键」里设置。"
+            "在右下角那张音效卡片的「快捷键」里设置，下面两行「触发 / 条件」\n"
+            "决定它是按下就响、按住才响、松手才响，还是要先按解锁键。\n"
+            "同一个键可以挂好几个音效（比如长按左键播组合、松手左键播另一句），\n"
+            "各自的触发方式分别生效。"
         )
         hint.setObjectName("Hint")
         hint.setWordWrap(True)
@@ -2595,36 +2628,78 @@ class HotkeyPage(QWidget):
 
         轮询器遇到重复绑定时会跳过后者，用户不知道就以为功能坏了
         （真实案例：重复上一个和呼出轮盘都绑成了 Y，按 Y 什么都不发生）。
-        """
-        owners: dict[str, list[str]] = {}
-        for label, box in self._bindings():
-            k = box.key_name
-            if k:
-                owners.setdefault(k, []).append(label)
-        if self.scfg is not None:
-            for name, hk in (self.scfg.hotkey_map() or {}).items():
-                hk = sr.norm_spec(hk)
-                if hk:
-                    owners.setdefault(hk, []).append(f"音效「{Path(name).stem}」")
 
-        for label, box in self._bindings():
-            k = box.key_name
-            others = [x for x in owners.get(k, []) if x != label] if k else []
-            if others:
-                box.mark_conflict(
-                    f"「{key_label(k)}」已经被{others[0]}占用，这里不会生效。"
-                    "换一个键，或者把那边改掉。"
+        v0.9 起**音效之间共用一个键是正常用法**：像"长按左键播 AAA、
+        松手左键播 B"本来就该挂在同一个键上，各自按自己的触发方式走。
+        所以只在"音效撞上四个全局键"时才提示——那种情况音效会被让路。
+        """
+        globals_ = [(label, box.key_name) for label, box in self._bindings()
+                    if box.key_name]
+        # 每个键上挂了哪些音效（同一键多个是正常的，这里只是收集）
+        sounds: dict[str, list[str]] = {}
+        if self.scfg is not None:
+            # 当前轮盘上的 + 勾了「全局通用」的（它们在任何轮盘上都会响应，
+            # 撞上呼出轮盘这类全局键一样会被让路，所以必须一起算）
+            groups: dict[str, list[str]] = {}
+            try:
+                for k, v in (self.scfg.hotkey_groups() or {}).items():
+                    groups.setdefault(k, []).extend(v)
+                for k, v in (self.scfg.global_hotkey_groups() or {}).items():
+                    bucket = groups.setdefault(k, [])
+                    for n in v:
+                        if n not in bucket:
+                            bucket.append(n)
+            except Exception:
+                groups = {}
+            for key, names in groups.items():
+                hk = sr.norm_spec(key)
+                if not hk:
+                    continue
+                for n in names:
+                    sounds.setdefault(hk, []).append(self.scfg.display_name(n))
+
+        # 1) 全局键之间互相撞：只有第一个生效（老规矩）
+        by_key: dict[str, list[str]] = {}
+        for label, k in globals_:
+            by_key.setdefault(k, []).append(label)
+
+        lines: list[str] = []
+        boxmap = dict(self._bindings())
+        for label, k in globals_:
+            box = boxmap[label]
+            if not k:
+                box.clear_conflict()
+                continue
+            mates = by_key.get(k, [])
+            mine = mates.index(label) if label in mates else 0
+            hit: list[str] = []
+            if mine > 0:
+                hit.append(f"「{key_label(k)}」已经被{mates[0]}占用，这里不会生效")
+            if k in sounds:
+                # 全局键优先，音效会让路
+                hit.append(
+                    f"「{key_label(k)}」上还挂着 {len(sounds[k])} 个音效"
+                    f"（{'、'.join(sounds[k][:3])}{'…' if len(sounds[k]) > 3 else ''}），"
+                    "全局键优先，这些音效按不出来"
                 )
+            if hit:
+                box.mark_conflict("；".join(hit) + "。换一个键，或者把那边改掉。")
             else:
                 box.clear_conflict()
 
-        clashes = [(k, names) for k, names in owners.items() if len(names) > 1]
-        if clashes:
-            lines = [
-                "按键冲突：" + "、".join(n) + f" 都绑成了「{key_label(k)}」，只有第一个生效。"
-                for k, n in clashes
-            ]
+        for k, names in by_key.items():
+            if len(names) > 1:
+                lines.append("按键冲突：" + "、".join(names)
+                             + f" 都绑成了「{key_label(k)}」，只有第一个生效。")
+        # 音效之间共用同一个键不算冲突，但值得说一声，免得用户以为自己设错了
+        shared = {k: v for k, v in sounds.items() if len(v) > 1 and k not in by_key}
+        for k, names in shared.items():
+            lines.append("共用「" + key_label(k) + "」：" + "、".join(names)
+                         + "（各自的触发方式分别生效，这是允许的）")
+
+        if lines:
             self.lbl_conflict.setText("\n".join(lines))
+            self.lbl_conflict.setStyleSheet("color:#ff8f8f;font-size:12px;")
             self.lbl_conflict.show()
         else:
             self.lbl_conflict.hide()
@@ -3664,6 +3739,65 @@ class HelpPage(QWidget):
             if i == 8:
                 s3.add_widget(self._link_row("VB-CABLE 下载页：", "https://vb-audio.com/Cable/"))
 
+        # ---- 补充：触发方式与条件解锁（v0.9）----
+        s3.para("补充｜触发方式与条件解锁", "head")
+        s3.para(
+            "右下那张卡片多了两行：「触发」和「条件」。它们决定快捷键按下之后"
+            "到底什么时候响、什么时候停，以及要不要先按解锁键。"
+        )
+        s3.para("触发（四选一）", "head")
+        s3.para(
+            "· 点击触发（默认）：按下就响一次，松手不管。和以前的版本完全一样。\n"
+            "· 长按触发：按住一直响，松手立刻停；再按一次会从头开始。"
+            "适合引擎声、警报这种「按住才有」的声音。\n"
+            "· 松手触发：按下不出声，松手的那一下才响。常和长按触发配对，"
+            "做成「按住放前奏、松手接下一句」。\n"
+            "· 长按连续触发：按下先响一次，之后只要还按着，就每隔一段时间"
+            "「再点一次」，间隔在那个 ms 框里调（50~2000）。\n"
+            "　 连击变调和变速会跟着一次次累加，所以按住不放就能做出"
+            "「越连越高的鬼畜」效果。整段按住只算 1 次点击，不会把解锁次数扣光。"
+        )
+        s3.para("条件（两档）", "head")
+        s3.para(
+            "· 无条件（默认）：按了就能响。\n"
+            "· 条件解锁：先按一下「解锁键」，这个音效才能在「解锁时间」内、"
+            "「解锁次数」内被触发。\n"
+            "　 解锁时间 0（显示「不限时」）= 一直有效，直到次数用完；\n"
+            "　 解锁次数 0（显示「不限次」）= 只看时间；\n"
+            "　 两个都 0 = 按一次解锁键，之后永远能用（留神别一直开着）。\n"
+            "　 时间到了只是「不能再触发新的」，正在响的声音会继续响完，不会被掐断。\n"
+            "　 同一个解锁键按一下，名下所有音效一起放开，各自算各自的时间和次数；"
+            "重复按是刷新，不叠加。"
+        )
+        s3.para("一个现成玩法：长按播组合、松手播另一句", "head")
+        s3.para(
+            "1. 建组合「AAA」，挂鼠标左键，「触发」选长按触发；「条件」选条件解锁，"
+            "解锁键 G、解锁时间 5000ms、次数不限。\n"
+            "2. 建音效「B」，也挂鼠标左键，「触发」选松手触发；「条件」同样选条件解锁，"
+            "解锁键 G、不限时、次数 1。\n"
+            "3. 效果：不按 G 时点左键什么都不发生；按一下 G 之后长按左键，AAA 起播，"
+            "松手 AAA 停、同时播 B。\n"
+            "4. 就算按完 G 过了 4.9 秒才按下左键，AAA 也照样能响 —— 解锁只决定"
+            "「能不能开始」，不负责「掐断」。\n"
+            "注意：一个键挂好几个音效是允许的，上面这种就是两个音效共用一个键，"
+            "各自的触发方式分别生效。"
+        )
+
+        # ---- 补充：全局通用（v0.9）----
+        s3.para("补充｜全局通用（快捷键不跟轮盘走）", "head")
+        s3.para(
+            "每个音效的「快捷键」框右边都有一个「全局通用」勾选框。默认不勾，"
+            "这时这个快捷键只在它所在的那套轮盘上使用。\n"
+            "勾上之后就不一样了：切换到别的轮盘，按这个键照样能触发它 —— "
+            "适合「不管在用哪套轮盘，这几个声音都想随手按得到」的情况。\n"
+            "· 勾了之后，它的音量、变调、长按方式仍然按它自己那套轮盘的设置来，"
+            "不会因为切了轮盘就变回默认值。\n"
+            "· 没绑快捷键时勾了也不起作用，鼠标停在勾选框上会有提示。\n"
+            "· 组合音效没有这一项：组合本来就是所有轮盘共用，专属热键天然全局。\n"
+            "· 如果这个键同时被「呼出轮盘」「重复上一个」这类全局键占着，"
+            "音效仍然会让路（按下不响），「快捷键」页顶部会标出来。"
+        )
+
         # ================= 四、常见问题 =================
         # 默认展开 + 主题色高亮：小白遇到问题第一反应是翻这里，
         # 让它藏在折叠条后面等于白写。
@@ -3806,6 +3940,25 @@ class HelpPage(QWidget):
                 "　 暂停和恢复的瞬间屏幕中间会闪一个小提示，一闪就消失，不会一直挂在上面。\n"
                 "　 嫌这个功能碍事？目前没法单独关掉它，但只要你不在圆点上松手就不会触发。",
             ),
+            (
+                "Q19 绑了快捷键，按下去却没声音？",
+                "先看那个音效「条件」里是不是选了「条件解锁」——选了就得先按一下解锁键。\n"
+                "再看「触发」：设成「松手触发」时，按下本来就不该响，得松手才响；"
+                "设成「长按触发」时，松手就停，声音会很短。\n"
+                "最后看「快捷键」页顶部的提示：如果这个键同时也是呼出轮盘 / 重复上一个 /"
+                "顺序播放 / 切换轮盘，全局键优先，挂在它上面的音效会被让路，换个键就好。\n"
+                "另外轮盘弹出的时候按鼠标左键/右键是「取消呼出」，那一下也不会播音效。",
+            ),
+            (
+                "Q20 直播想让观众听到音效，但自己不想听？",
+                "「麦克风」页勾上「把音效送进游戏语音」，虚拟声卡选 CABLE Input，"
+                "然后把「音效也从自己的耳机里放出来」这个勾**取消**。\n"
+                "这样音效只往虚拟声卡那一路走，你自己的耳朵里一点都没有。\n"
+                "注意程序有条兜底：如果「本地监听」和「送对方」两个都关掉，"
+                "它会自动把监听打开（不然整个软件就成了哑巴），所以不能靠「全关」来实现。\n"
+                "直播/开黑软件里把音频输入设成 CABLE Output；"
+                "如果不想把自己的说话声一起送过去，把「原声·送对方」拉到 0%。",
+            ),
         ]
         for q, a in faq:
             s4.para(q, "head")
@@ -3882,14 +4035,20 @@ def _drag_pixmap(text: str, width: int = 150, height: int = 38) -> QPixmap:
     return pm
 
 
+# 预览框比轮盘本身多留的边（左右各 PREVIEW_PAD/2）。
+# v0.9 从 48 收窄到 36：右下角那张卡片多了「触发 / 条件」两行，
+# 少留点白，最小窗口、最大直径时预览也不会被裁掉。
+PREVIEW_PAD = 36
+
+
 def preview_radius_of(cfg: dict) -> int:
     """预览用的轮盘半径：跟「直径」等比，但夹在 150~235 之间。
 
     180（默认直径）对应 190，比老版本那个 172 大约 10%——用户反馈预览
     "看着比以前小一圈"，实际上是无处安放的留白太多，整体放大一点点就正常了。
     直径调大时预览框跟着长，否则把轮盘调到 215、预览还停在老尺寸会更显小。
-    上限 210 是为了别把预览卡片撑破：最小窗口（980×750）下卡片高度只有 476，
-    预览控件 210×2+48=468 刚好塞得下。
+    上限 210 是为了别把预览卡片撑破：最小窗口（980×800）下卡片高度只有 468，
+    预览控件 210×2+36=456 刚好塞得下。
     """
     try:
         r = int(round(float(cfg.get("wheel_radius", 180)) * 190.0 / 180.0))
@@ -4134,11 +4293,14 @@ class SlotDetail(QFrame):
         self._loading = False
         self.setObjectName("Card")
         # 高度写死，免得内容增减时面板自己跳；改动行数后记得同步这个值
-        self.setFixedHeight(188)
+        # 188 → 246：v0.9 加了「触发」和「条件」两行
+        self.setFixedHeight(246)
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(16, 10, 16, 10)
-        lay.setSpacing(6)
+        # v0.9：多了「触发 / 条件」两行，上下留白和行距都收一点，
+        # 否则卡片要再长 10 多个像素，窗口就得多长一点
+        lay.setContentsMargins(16, 8, 16, 8)
+        lay.setSpacing(4)
 
         head = QHBoxLayout()
         self.title = QLabel("未选中音效")
@@ -4157,7 +4319,7 @@ class SlotDetail(QFrame):
         self.body = QWidget()
         body = QVBoxLayout(self.body)
         body.setContentsMargins(0, 0, 0, 0)
-        body.setSpacing(6)
+        body.setSpacing(4)
 
         vol_row = QHBoxLayout()
         vl = QLabel("音量")
@@ -4256,6 +4418,19 @@ class SlotDetail(QFrame):
         win_row.addWidget(hl)
         self.hotkey = KeyBox("", 116)
         win_row.addWidget(self.hotkey)
+        # 全局通用：勾上之后这个键不再跟着轮盘走（组合本身就不分轮盘，见下面）。
+        # 文字用两字"全局"：这一行元素已经排满（连击窗口 + 快捷键 + 清除键），
+        # 四字在最小窗口下会把按键框挤扁，完整说明放提示里。
+        self.chk_global = QCheckBox("全局")
+        self.chk_global.setObjectName("GlobalChk")
+        self.chk_global.setToolTip(
+            "「全局通用」：勾上之后，这个快捷键不再跟着轮盘走，\n"
+            "切换到别的轮盘，按这个键照样能触发它。\n"
+            "不勾的时候只在它所在的这一套轮盘上生效（和以前一样）。\n"
+            "没绑快捷键时这一项不起作用。\n"
+            "组合音效本来就是全轮盘共用，没有这个开关。"
+        )
+        win_row.addWidget(self.chk_global)
         body.addLayout(win_row)
 
         # 组合条目专用说明：变调/变速在组合编辑器里逐项设
@@ -4268,6 +4443,85 @@ class SlotDetail(QFrame):
         self.lbl_combo_hint.hide()
         body.addWidget(self.lbl_combo_hint)
 
+        # ---- 触发方式（v0.9）：按下响 / 长按响 / 松手响 / 按住连发 ----
+        trig_row = QHBoxLayout()
+        self.lbl_trigger = tl = QLabel("触发")
+        tl.setFixedWidth(52)
+        tl.setStyleSheet("color:#a9b0c0;font-size:12px;")
+        trig_row.addWidget(tl)
+        self.trigger_mode = QComboBox()
+        for mode in TRIGGER_MODES:
+            self.trigger_mode.addItem(TRIGGER_MODE_LABEL.get(mode, mode), mode)
+        self.trigger_mode.setToolTip(
+            "按下快捷键之后，这个音效什么时候响、什么时候停。\n"
+            "点击触发：按下就响一次（和以前一样）\n"
+            "长按触发：按住一直响，松手立刻停\n"
+            "松手触发：按下不出声，松手那一下才响\n"
+            "长按连续触发：按住不放就按间隔一直「点」下去，\n"
+            "　　　　　　　连击变调/变速会跟着累加"
+        )
+        trig_row.addWidget(self.trigger_mode, 1)
+        self.repeat_ms = QSpinBox()
+        self.repeat_ms.setRange(REPEAT_MS_MIN, REPEAT_MS_MAX)
+        self.repeat_ms.setSingleStep(10)
+        self.repeat_ms.setValue(200)
+        self.repeat_ms.setSuffix(" ms")
+        self.repeat_ms.setFixedWidth(94)
+        self.repeat_ms.setToolTip(
+            "长按连续触发的间隔：按住时每隔这么久再响一次。\n"
+            "小一点（100ms 左右）= 连成一片；大一点 = 一下一下地蹦。"
+        )
+        trig_row.addWidget(self.repeat_ms)
+        self.lbl_repeat_hint = QLabel("按住时每隔这么久再响一次")
+        self.lbl_repeat_hint.setObjectName("Hint")
+        trig_row.addWidget(self.lbl_repeat_hint)
+        trig_row.addStretch(1)
+        body.addLayout(trig_row)
+
+        # ---- 触发条件（v0.9）：无条件 / 先用解锁键开门 ----
+        cond_row = QHBoxLayout()
+        self.lbl_unlock = cl = QLabel("条件")
+        cl.setFixedWidth(52)
+        cl.setStyleSheet("color:#a9b0c0;font-size:12px;")
+        cond_row.addWidget(cl)
+        self.unlock_mode = QComboBox()
+        for mode in UNLOCK_MODES:
+            self.unlock_mode.addItem(UNLOCK_MODE_LABEL.get(mode, mode), mode)
+        self.unlock_mode.setToolTip(
+            "无条件：按了就能响。\n"
+            "条件解锁：先按一下「解锁键」，这个音效才能被触发。"
+        )
+        cond_row.addWidget(self.unlock_mode, 1)
+        self.unlock_key = KeyBox("", 96)
+        self.unlock_key.setToolTip(
+            "解锁键：按一下它，名下所有音效一起放开（各自算各自的时间和次数）。\n"
+            "重复按是刷新，不会叠加次数。"
+        )
+        cond_row.addWidget(self.unlock_key)
+        self.unlock_ms = QSpinBox()
+        self.unlock_ms.setRange(0, UNLOCK_MS_MAX)
+        self.unlock_ms.setSingleStep(500)
+        self.unlock_ms.setSuffix(" ms")
+        self.unlock_ms.setSpecialValueText("不限时")
+        self.unlock_ms.setFixedWidth(96)
+        self.unlock_ms.setToolTip(
+            "解锁后多久之内可以触发。0 = 不限时（一直到次数用完）。\n"
+            "注意：时间到了只是「不能再触发新的」，正在响的声音会继续响完。"
+        )
+        cond_row.addWidget(self.unlock_ms)
+        self.unlock_count = QSpinBox()
+        self.unlock_count.setRange(0, UNLOCK_COUNT_MAX)
+        self.unlock_count.setSingleStep(1)
+        self.unlock_count.setSuffix(" 次")
+        self.unlock_count.setSpecialValueText("不限次")
+        self.unlock_count.setFixedWidth(90)
+        self.unlock_count.setToolTip(
+            "解锁一次能用几次。0 = 不限次。\n"
+            "长按连续触发整段按住也只算 1 次。"
+        )
+        cond_row.addWidget(self.unlock_count)
+        body.addLayout(cond_row)
+
         lay.addWidget(self.body)
         lay.addStretch(1)
 
@@ -4279,7 +4533,14 @@ class SlotDetail(QFrame):
         self.pitch_window.valueChanged.connect(self._push)
         self.speed_mode.currentIndexChanged.connect(self._push)
         self.speed_step.currentIndexChanged.connect(self._push)
-        self.hotkey.key_changed.connect(lambda _v: self._push())
+        self.hotkey.key_changed.connect(self._on_hotkey_changed)
+        self.chk_global.toggled.connect(self._on_global_toggled)
+        self.trigger_mode.currentIndexChanged.connect(self._on_trigger_changed)
+        self.repeat_ms.valueChanged.connect(self._push)
+        self.unlock_mode.currentIndexChanged.connect(self._on_unlock_changed)
+        self.unlock_key.key_changed.connect(lambda _v: self._push())
+        self.unlock_ms.valueChanged.connect(self._push)
+        self.unlock_count.valueChanged.connect(self._push)
         self.btn_play.clicked.connect(
             lambda: self.current and self.preview_requested.emit(self.current)
         )
@@ -4300,6 +4561,14 @@ class SlotDetail(QFrame):
         if name is None:
             self.title.setText("未选中音效")
             self.title.setStyleSheet("color:#6f7686;")
+            # 没选中时把触发相关控件复位，免得留着上一个音效的值骗人
+            self.trigger_mode.setCurrentIndex(0)
+            self.repeat_ms.setValue(200)
+            self.unlock_mode.setCurrentIndex(0)
+            self.unlock_key.set_key("")
+            self.unlock_ms.setValue(0)
+            self.unlock_count.setValue(0)
+            self.chk_global.setChecked(False)
         else:
             self.title.setText(
                 self.scfg.display_name(name) if self._is_combo else Path(name).stem
@@ -4327,15 +4596,62 @@ class SlotDetail(QFrame):
                 si2 = min(range(len(vals)), key=lambda k: abs(vals[k] - float(st.speed_step)))
             self.speed_step.setCurrentIndex(max(0, si2))
             self.hotkey.set_key(st.hotkey)
+            self.chk_global.setChecked(bool(getattr(st, "global_hotkey", False)))
+
+            # ---- 触发方式 / 触发条件 ----
+            ti = self.trigger_mode.findData(st.trigger_mode)
+            self.trigger_mode.setCurrentIndex(max(0, ti))
+            self.repeat_ms.setValue(int(getattr(st, "repeat_ms", 200)))
+            ui = self.unlock_mode.findData(st.unlock_mode)
+            self.unlock_mode.setCurrentIndex(max(0, ui))
+            self.unlock_key.set_key(getattr(st, "unlock_key", "") or "")
+            self.unlock_ms.setValue(int(getattr(st, "unlock_ms", 0)))
+            self.unlock_count.setValue(int(getattr(st, "unlock_count", 0)))
 
         for w in (self.volume, self.pitch_mode, self.pitch_step,
                   self.pitch_fixed,
                   self.speed_mode, self.speed_step,
-                  self.pitch_window, self.hotkey, self.btn_play):
+                  self.pitch_window, self.hotkey, self.btn_play,
+                  self.trigger_mode, self.repeat_ms,
+                  self.unlock_mode, self.unlock_key,
+                  self.unlock_ms, self.unlock_count, self.chk_global):
             w.setEnabled(name is not None)
         self.btn_combo.setVisible(self._is_combo)
         self._sync_pitch_enabled()
+        self._sync_trigger_ui()
+        self._sync_global_hint()
         self._loading = False
+
+    def _sync_trigger_ui(self) -> None:
+        """按当前选择显示/藏起"用不上"的那几个格子。
+
+        长按连续触发才需要间隔；条件解锁才需要解锁键/时间/次数。
+        其余一律藏掉 —— 面板就这么点地方，留着灰框只会让人猜。
+        """
+        mode = str(self.trigger_mode.currentData() or "")
+        is_repeat = mode == TRIGGER_REPEAT
+        self.repeat_ms.setVisible(is_repeat)
+        self.lbl_repeat_hint.setVisible(is_repeat)
+
+        locked = str(self.unlock_mode.currentData() or "") == UNLOCK_KEY
+        self.unlock_key.setVisible(locked)
+        self.unlock_ms.setVisible(locked)
+        self.unlock_count.setVisible(locked)
+        # 选了"条件解锁"却没设键：等于没锁，直接在提示里说清楚，
+        # 免得用户以为设置坏了
+        if locked and self.current is not None and not self.unlock_key.key_name:
+            self.lbl_repeat_hint.setText("注意：还没设解锁键，现在等于无条件")
+            self.lbl_repeat_hint.setVisible(True)
+        elif is_repeat:
+            self.lbl_repeat_hint.setText("按住时每隔这么久再响一次")
+
+    def _on_trigger_changed(self) -> None:
+        self._sync_trigger_ui()
+        self._push()
+
+    def _on_unlock_changed(self) -> None:
+        self._sync_trigger_ui()
+        self._push()
 
     def _sync_pitch_enabled(self) -> None:
         """随机/固定变调都不看连击窗口：那一格换成一句说明。
@@ -4350,11 +4666,14 @@ class SlotDetail(QFrame):
                       self.lbl_rand_hint, self.lbl_fixed_hint):
                 w.setVisible(False)
             self.lbl_combo_hint.setVisible(self.current is not None)
+            # 组合的专属热键本来就是全轮盘共用，没有"跟不跟轮盘走"这回事
+            self.chk_global.setVisible(False)
             return
         # 普通音效：先把组合模式藏掉的那批"无条件放回来"，再按当前模式做减法。
         # 隐藏是粘性的 —— 只要没显式 setVisible(True)，控件就永远不再出现，
         # 所以这里必须逐个还原，不能只还原"可能要藏的那几个"。
         self.lbl_combo_hint.setVisible(False)
+        self.chk_global.setVisible(True)
         self.lbl_pitch.setVisible(True)
         self.pitch_mode.setVisible(True)
         self.lbl_speed.setVisible(True)
@@ -4376,6 +4695,33 @@ class SlotDetail(QFrame):
         self.lbl_fixed_hint.setVisible(bool(fixed and not speed_on
                                             and self.current is not None))
 
+    def _on_hotkey_changed(self, _key: str = "") -> None:
+        self._sync_global_hint()
+        self._push()
+
+    def _on_global_toggled(self, _on: bool = False) -> None:
+        self._sync_global_hint()
+        self._push()
+
+    def _sync_global_hint(self) -> None:
+        """勾了「全局通用」却没绑键时，把"它暂时不生效"直接说出来。
+
+        不改复选框的文字（那一行已经排满，加字会挤），改成换提示，
+        鼠标悬停就能看到原因，免得用户以为功能没做好。
+        """
+        if self.chk_global.isChecked() and not self.hotkey.key_name:
+            self.chk_global.setToolTip(
+                "已经勾上了，但这个音效还没绑快捷键 ——\n"
+                "没有键可以按，这一项暂时不会生效。先在左边绑一个键。"
+            )
+        else:
+            self.chk_global.setToolTip(
+                "「全局通用」：勾上之后，这个快捷键不再跟着轮盘走，\n"
+                "切换到别的轮盘，按这个键照样能触发它。\n"
+                "不勾的时候只在它所在的这一套轮盘上生效（和以前一样）。\n"
+                "组合音效本来就是全轮盘共用，没有这个开关。"
+            )
+
     def _emit_edit_combo(self) -> None:
         if self.current and is_combo_key(self.current):
             self.edit_combo_requested.emit(self.current[len(COMBO_PREFIX):])
@@ -4385,6 +4731,13 @@ class SlotDetail(QFrame):
             return
         st = self.scfg.setting(self.current)
         st.volume = self.volume.value() / 100.0
+        # 触发方式和触发条件对普通音效和组合一视同仁
+        st.trigger_mode = str(self.trigger_mode.currentData() or "tap")
+        st.repeat_ms = int(self.repeat_ms.value())
+        st.unlock_mode = str(self.unlock_mode.currentData() or "none")
+        st.unlock_key = self.unlock_key.key_name
+        st.unlock_ms = int(self.unlock_ms.value())
+        st.unlock_count = int(self.unlock_count.value())
         if self._is_combo:
             # 组合没有"整体变调/速度"这回事，逐项参数归编辑器管
             st.hotkey = self.hotkey.key_name
@@ -4398,6 +4751,7 @@ class SlotDetail(QFrame):
         st.speed_mode = str(self.speed_mode.currentData() or "none")
         st.speed_step = float(self.speed_step.currentData() or 0.10)
         st.hotkey = self.hotkey.key_name
+        st.global_hotkey = bool(self.chk_global.isChecked())
         self.vol_val.setText(f"{self.volume.value()}%")
         self._sync_pitch_enabled()
         self.setting_changed.emit(self.current)
@@ -4506,8 +4860,10 @@ class SettingsWindow(QWidget):
         )
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setWindowTitle("SR Voiceover Roulette 设置")
-        self.resize(1120, 780)
-        self.setMinimumSize(980, 750)
+        # 高度 780 → 840：v0.9 的音效卡片多了「触发」「条件」两行，
+        # 不把窗口放高一点，右下角那块和轮盘预览会互相挤
+        self.resize(1120, 840)
+        self.setMinimumSize(980, 800)
         self.setStyleSheet(build_qss())
 
         outer = QVBoxLayout(self)
@@ -4587,7 +4943,7 @@ class SettingsWindow(QWidget):
         # 之前固定写死 172，导致直径调到 215 了预览还是老尺寸，看着偏小
         self.preview_cfg["wheel_radius"] = preview_radius_of(cfg)
         self.preview = WheelPreview(self.preview_cfg, bank)
-        side = int(self.preview_cfg["wheel_radius"] * 2 + 48)
+        side = int(self.preview_cfg["wheel_radius"] * 2 + PREVIEW_PAD)
         self.preview.setFixedSize(side, side)
         self.preview.bank = bank
         self.preview.selected = 0 if len(bank) else None
@@ -4824,7 +5180,7 @@ class SettingsWindow(QWidget):
         r = preview_radius_of(cfg)
         if r != int(self.preview_cfg["wheel_radius"]):
             self.preview_cfg["wheel_radius"] = r
-            side = int(r * 2 + 48)
+            side = int(r * 2 + PREVIEW_PAD)
             self.preview.setFixedSize(side, side)
         self.preview.update()
         sr.save_config(cfg)

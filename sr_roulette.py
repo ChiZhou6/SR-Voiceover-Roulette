@@ -132,11 +132,19 @@ from sounds_config import (
     PITCH_FIXED,
     PITCH_NONE,
     PITCH_RANDOM,
+    REPEAT_MS_MAX,
+    REPEAT_MS_MIN,
     SPEED_DOWN,
     SPEED_NONE,
     TRIG_COMBO,
     TRIG_PREV_END,
     TRIG_PREV_START,
+    TRIGGER_HOLD,
+    TRIGGER_RELEASE,
+    TRIGGER_REPEAT,
+    TRIGGER_TAP,
+    UNLOCK_KEY,
+    SoundSetting,
     SoundsConfig,
     is_combo_key,
 )
@@ -144,7 +152,7 @@ import theme
 from theme import accent, accent_dark, accent_light, set_accent
 
 APP_NAME = "SR Voiceover Roulette"
-APP_VERSION = "v0.8.2"
+APP_VERSION = "v0.9.0"
 
 DEBUG = os.environ.get("SR_DEBUG") == "1"
 
@@ -2006,7 +2014,8 @@ class Mixer(QIODevice):
         return (1 << 20) + super().bytesAvailable()
 
     def trigger(self, clip: np.ndarray, gain: float = 1.0, delay: int = 0,
-                group: str | None = None, max_voices: int = 0) -> bool:
+                group: str | None = None, max_voices: int = 0,
+                token: int = 0) -> bool:
         """播放一段波形。直接收 clip 而不是索引，因为变调后的波形是临时算的。
 
         delay 是"再过多少帧才开始响"，组合音效靠它做排程：
@@ -2016,15 +2025,47 @@ class Mixer(QIODevice):
         group / max_voices 是"同一条组合最多几条声音同时在响"：
         超了就把这条组合最早的那条掐掉（正在响的走 12ms 淡出，
         还没开口的直接摘掉）。不同组合各算各的，互不影响。
+
+        token 是"这一次触发"的编号（v0.9）。同一次触发的所有声部共用它，
+        松手要停的时候按编号一起掐 —— 见 stop_token()。0 表示不参与
+        按次停止（普通点击触发就是这样，响了就让它响完）。
         """
         if clip is None or len(clip) == 0:
             return False
         if group and max_voices > 0:
             self._retire_oldest(group, max_voices)
         # 同一音效连按两次时叠加播放，不做打断，免得出现截断的尾巴
-        # [波形, 播放位置, 音量, 淡出剩余帧, 延迟剩余帧, 分组]
-        self.voices.append([clip, 0, float(gain), 0, max(0, int(delay)), group])
+        # [波形, 播放位置, 音量, 淡出剩余帧, 延迟剩余帧, 分组, 这次触发的编号]
+        self.voices.append(
+            [clip, 0, float(gain), 0, max(0, int(delay)), group, int(token)]
+        )
         return True
+
+    def stop_token(self, token: int, fade_ms: float = 12.0) -> int:
+        """掐掉"某一次触发"产生的全部声部，别的触发一概不碰。
+
+        长按触发松手就靠这个：一次按住期间可能叠了好几路（组合排程里
+        后面几项还在延迟等开口），松手时必须一起收掉，否则一秒钟后
+        还有声音自己冒出来。返回真正处理掉的条数。
+        """
+        if not token:
+            return 0
+        fade = max(0, int(self.rate * fade_ms / 1000.0))
+        kept: list[list] = []
+        n = 0
+        for voice in self.voices:
+            if len(voice) < 7 or voice[6] != token:
+                kept.append(voice)
+                continue
+            n += 1
+            if voice[4] > 0:
+                continue          # 还没开口：直接摘掉，不用淡出
+            if fade <= 0:
+                continue          # 立刻切（调用方自己承担爆音）
+            voice[3] = max(1, fade)
+            kept.append(voice)
+        self.voices = kept
+        return n
 
     def _retire_oldest(self, group: str, max_voices: int) -> None:
         """这条分组里的声音超过上限时，把最老的几条让出去。
@@ -2186,6 +2227,10 @@ class AudioEngine(QObject):
         self._last_problem = ""            # 上次通知过用户的故障，避免反复弹窗
         self._struct_sig: tuple | None = None
         self.clips: list[np.ndarray] = []
+        # 全局通用的音效：勾了「全局通用」但不在当前轮盘上的，波形追加在
+        # clips 末尾（下标从 len(bank) 起），这样切换轮盘后快捷键照样能响。
+        # key -> clips 下标；不在这个表里的 key 走普通槽位查找。
+        self._global_slots: dict[str, int] = {}
         # 连击变调用：某个槽位上次播放的时间、当前累计半音偏移
         self._last_at: dict[int, float] = {}
         self._pitch_now: dict[int, float] = {}
@@ -2206,6 +2251,9 @@ class AudioEngine(QObject):
         self._warm_timer: QTimer | None = None
         self.last_idx: int | None = None   # 供"重复上一个"使用
         self._cycle = -1                   # 供"顺序播放"使用
+        # 每一次"按下触发"的编号：长按触发松手时按这个编号整次掐掉。
+        # 从 1 开始，0 留给"不参与按次停止"的普通点击触发。
+        self._token_seq = 0
         self.load()
 
     # ---- 解码 ----
@@ -2216,9 +2264,11 @@ class AudioEngine(QObject):
         换掉 clips 列表碰不到它们，所以可以不断音地换盘。
         """
         self.clips = []
+        self._global_slots = {}
         fade_ms = float(self.cfg.get("fade_ms", 6))
         n_real = 0
-        for idx in range(len(self.bank)):
+        slot_n = len(self.bank)
+        for idx in range(slot_n):
             path = self.bank.path_at(idx)
             if path is None:
                 # 组合条目（或已删掉的文件）占一个 None，保持下标和槽位对齐
@@ -2228,6 +2278,36 @@ class AudioEngine(QObject):
             self.clips.append(clip)
             if clip is not None:
                 n_real += 1
+        n_slot_real = n_real
+
+        # ---- 全局通用音效：不在当前轮盘上的，追加到槽位后面 ----
+        # 它们的下标从 slot_n 起，绘制和槽位逻辑完全看不到（那边只认前
+        # len(bank) 个），只有 play_named() 会按 key 找过来。
+        n_global = 0
+        scfg = getattr(self.bank, "scfg", None)
+        if scfg is not None:
+            try:
+                gnames = scfg.global_names()
+            except Exception as exc:
+                gnames = []
+                _log(f"[audio] 读全局快捷键失败: {exc}")
+            if gnames:
+                on_wheel = {self.bank.full_at(i) for i in range(slot_n)}
+                files = dict(scan_sound_files())
+                for key in gnames:
+                    if key in on_wheel:
+                        continue        # 当前轮盘就有，直接用它的槽位
+                    path = files.get(key)
+                    if path is None:
+                        continue        # 文件被删了，下次同步会清掉记录
+                    clip = decode_clip(path, self.fmt, fade_ms)
+                    if clip is None:
+                        continue
+                    self._global_slots[key] = len(self.clips)
+                    self.clips.append(clip)
+                    n_global += 1
+        n_real += n_global
+
         for mix in self._mixers_all():
             mix.clips = self.clips
             if stop_playing:
@@ -2235,8 +2315,9 @@ class AudioEngine(QObject):
         self._stretch_cache.clear()     # 波形换了，旧的拉伸结果不能再用
         self._combo_cache.clear()
         _LIB_CACHE.clear()
-        n_combo = len(self.bank) - n_real
+        n_combo = slot_n - n_slot_real
         _log(f"[audio] 已装载 {n_real} 个音效"
+             + (f"（其中 {n_global} 个全局通用）" if n_global else "")
              + (f" + {n_combo} 个组合" if n_combo else "")
              + f"（{self.fmt.sampleRate()}Hz/{self.fmt.channelCount()}ch）")
 
@@ -2623,8 +2704,33 @@ class AudioEngine(QObject):
             "dropped": self.capture.dropped if self.capture else 0,
         }
 
-    def play(self, idx: int) -> bool:
-        """播放第 idx 个槽位。会按该音效自己的设置算音量和变调。"""
+    def _setting_of_slot(self, idx: int):
+        """clips 下标 -> 这个音效的参数（含"全局通用"那批追加槽位）。
+
+        普通槽位直接从音效库取；追加进来的全局音效不在库的 items 里，
+        得用 setting_any() 跨轮盘去找它原本那套参数，否则音量/变调/长按
+        方式会全部退回默认值，听起来像设置丢了。
+        """
+        st = self.bank.setting_at(idx)
+        if st is not None:
+            return st
+        scfg = getattr(self.bank, "scfg", None)
+        if scfg is None:
+            return None
+        for key, i in self._global_slots.items():
+            if i == idx:
+                try:
+                    return scfg.setting_any(key)
+                except Exception:
+                    return None
+        return None
+
+    def play(self, idx: int, token: int = 0) -> bool:
+        """播放第 idx 个槽位。会按该音效自己的设置算音量和变调。
+
+        token 只在"长按触发"里用：这一次按住的全部声部都打上同一个编号，
+        松手时按编号一次停干净（见 stop_token）。默认 0 = 响了就让它响完。
+        """
         if not self._active_mixers():
             self.rebuild()
         if not (0 <= idx < len(self.clips)):
@@ -2633,7 +2739,7 @@ class AudioEngine(QObject):
         # 组合条目：不走普通音效那套连击变调，直接进组合排程
         entry = self.bank.entry_at(idx)
         if isinstance(entry, ComboEntry):
-            ok = self.play_combo(entry.cdef)
+            ok = self.play_combo(entry.cdef, token=token)
             if ok:
                 self.last_idx = idx
             return ok
@@ -2641,7 +2747,7 @@ class AudioEngine(QObject):
         clip = self.clips[idx]
         if clip is None:
             return False
-        st = self.bank.setting_at(idx)
+        st = self._setting_of_slot(idx)
         gain = 1.0
         semitones = 0.0
         speed = 0.0
@@ -2705,7 +2811,7 @@ class AudioEngine(QObject):
         # 每个出口都要触发一次（波形是同一个，进度各走各的）
         ok = False
         for mix in self._active_mixers():
-            ok = mix.trigger(clip, gain) or ok
+            ok = mix.trigger(clip, gain, token=token) or ok
         return ok
 
     # ---- 组合播放 ----
@@ -2829,7 +2935,8 @@ class AudioEngine(QObject):
             ok = mix.trigger(clip, 1.0) or ok
         return ok
 
-    def play_combo(self, cdef: ComboDef, from_row: int | None = None) -> bool:
+    def play_combo(self, cdef: ComboDef, from_row: int | None = None,
+                   token: int = 0) -> bool:
         """播放一个组合音效。
 
         步骤只有三步，全部可预期：
@@ -2914,7 +3021,8 @@ class AudioEngine(QObject):
             gain = vol * max(0.0, float(it.gain))
             for mix in self._active_mixers():
                 ok = mix.trigger(clip, gain, delay,
-                                 group=cdef.cid, max_voices=max_voices) or ok
+                                 group=cdef.cid, max_voices=max_voices,
+                                 token=token) or ok
         if DEBUG:
             _log(f"[combo] {cdef.name}: 排程 {len(plan)} 项 "
                  + ", ".join(f"#{i + 1}@{d / rate:.2f}s" for i, d in plan))
@@ -3010,34 +3118,40 @@ class AudioEngine(QObject):
             return False, f"写入失败：{exc}"
         return True, f"已导出：{Path(path).name}（{len(data) / float(rate):.2f} 秒）"
 
-    def play_repeat_last(self) -> bool:
+    def play_repeat_last(self, token: int = 0) -> bool:
         """重复播放上一次的音效。"""
         if self.last_idx is None:
             return False
-        return self.play(self.last_idx)
+        return self.play(self.last_idx, token=token)
 
-    def play_next(self) -> bool:
+    def play_next(self, token: int = 0) -> bool:
         """按槽位顺序播放下一个，到末尾回到开头。"""
         n = len(self.bank)
         if n == 0:
             return False
         self._cycle = (self._cycle + 1) % n
-        return self.play(self._cycle)
+        return self.play(self._cycle, token=token)
 
-    def play_named(self, name: str) -> bool:
+    def play_named(self, name: str, token: int = 0) -> bool:
         """按配置键触发（快捷键用）。
 
         组合没上轮盘时也该能被专属热键按响，所以找不到槽位时再查一次
         组合表——热键的意义本来就是"不占格子也能用"。
+
+        勾了「全局通用」的音效，切换轮盘后不在当前槽位里，但在 load()
+        时已经额外准备了一份波形（见 _global_slots），这里同样能按响。
         """
         idx = self.bank.index_of_name(name)
         if idx >= 0:
-            return self.play(idx)
+            return self.play(idx, token=token)
+        g = self._global_slots.get(name)
+        if g is not None:
+            return self.play(g, token=token)
         scfg = getattr(self.bank, "scfg", None)
         if scfg is not None and is_combo_key(name):
             cdef = scfg.combos.get(name[len(COMBO_PREFIX):])
             if cdef is not None:
-                return self.play_combo(cdef)
+                return self.play_combo(cdef, token=token)
         return False
 
     def _roll_random(self, idx: int, amp: float) -> float:
@@ -3086,12 +3200,30 @@ class AudioEngine(QObject):
         for mix in self._mixers_all():
             mix.stop_all()
 
+    # ---- 按次停止（v0.9：长按触发松手就停）----
+    def new_token(self) -> int:
+        """领一个新的触发编号。所有非 0 的编号都只用来"整次停掉"。"""
+        self._token_seq += 1
+        return self._token_seq
+
+    def stop_token(self, token: int) -> None:
+        """停掉某一次触发放出去的全部声音。token=0 什么也不做。"""
+        if not token:
+            return
+        for mix in self._mixers_all():
+            mix.stop_token(token)
+
     @property
     def playing(self) -> bool:
         return any(mix.playing for mix in self._mixers_all())
 
     def __len__(self) -> int:
-        return len(self.clips)
+        """轮盘上真正占用槽位的音效数（不含追加的全局通用音效）。
+
+        界面上的「已加载音效 N 个（上限 20）」和顺序播放/重复上一个都要的
+        是槽位数；全局音效只是额外挂着的可播放副本，不能算进去。
+        """
+        return len(self.bank)
 
 
 # ---------------------------------------------------------------- 轮盘窗口
@@ -4326,8 +4458,19 @@ class InputPoller(QObject):
         self._timer.setTimerType(Qt.PreciseTimer)
         self._timer.setInterval(max(4, int(cfg.get("poll_ms", 8))))
         self._timer.timeout.connect(self.tick)
-        self._extra: list[tuple[int, object]] = []
-        self._extra_prev: dict[int, bool] = {}
+        # ---- 全局"一击"动作（重复上一个 / 顺序播放）----
+        self._actions: list[tuple[str, object]] = []
+        self._action_prev: dict[str, bool] = {}
+        # ---- 音效快捷键（v0.9：一个键可以挂多个音效）----
+        self._by_key: dict[str, list[str]] = {}      # 按键 -> [音效键, ...]
+        self._key_prev: dict[str, bool] = {}         # 按键上一帧是否按着
+        self._hold_token: dict[str, int] = {}        # 音效键 -> 这次按住的声音编号
+        self._repeat_next: dict[str, float] = {}     # 音效键 -> 下一次连发的时刻
+        # ---- 条件解锁 ----
+        # 音效键 -> [解锁截止时刻, 剩余次数]；次数 -1 表示不限
+        self._unlock: dict[str, list[float]] = {}
+        self._unlock_keys: dict[str, list[str]] = {}  # 解锁键 -> [音效键, ...]
+        self._unlock_prev: dict[str, bool] = {}
         # 返回 True 时暂停响应按键（配置窗口打开时用，免得打字把轮盘弹出来）
         self.paused: object = None
         # 用户自己按出来的暂停（轮盘中心松手）。和上面那个"设置窗口占着键盘"
@@ -4357,6 +4500,8 @@ class InputPoller(QObject):
         if on == self.user_paused:
             return
         self.user_paused = on
+        if on:
+            self._stop_holds()      # 暂停了就别让长按的声音一直挂着
         _log(f"[pause] {'暂停' if on else '恢复'}")
         if callable(self.on_pause_changed):
             self.on_pause_changed(on)
@@ -4422,46 +4567,266 @@ class InputPoller(QObject):
         return True
 
     def rebuild_bindings(self) -> None:
-        """重建"额外快捷键"绑定。改了快捷键或增删音效后调用一次。
+        """重建快捷键绑定。改了快捷键或增删音效后调用一次。
 
         绑定存的是**按键名**（"y" / "f1" / "mouse_4"），不是虚拟键码，
         这样鼠标按键和键盘按键能用同一套逻辑，也不会出现两个不同的键
         映射到同一个码时互相顶掉。
+
+        v0.9 起一个键可以挂**多个**音效：像"长按左键播 AAA、松手左键播 B"
+        这种玩法本来就是两个音效共用一个键，各自按自己的触发方式响应。
+        四个"全局键"（呼出轮盘 / 重复上一个 / 顺序播放 / 切换轮盘）仍然
+        优先，被它们占了的键不再给音效用，免得一按又弹轮盘又出声。
         """
-        bindings: list[tuple[str, object]] = []
+        actions: list[tuple[str, object]] = []
         seen: set[str] = {norm_spec(self.cfg.get("hotkey", "y"))}
 
         rk = norm_spec(self.cfg.get("repeat_last_key", ""))
         if rk and rk not in seen:
-            bindings.append((rk, self.audio.play_repeat_last))
+            actions.append((rk, self.audio.play_repeat_last))
             seen.add(rk)
 
         ck = norm_spec(self.cfg.get("cycle_key", ""))
         if ck and ck not in seen:
-            bindings.append((ck, self.audio.play_next))
+            actions.append((ck, self.audio.play_next))
             seen.add(ck)
 
         sk = norm_spec(self.cfg.get("switch_key", ""))
         if sk:
             seen.add(sk)      # 切换轮盘的键不参与"播放音效"绑定，这里只是占位防冲突
 
+        # 绑定变了，还按着的长按音效就没人管了：先掐掉，免得一直响着停不下来
+        self._stop_holds()
+
+        by_key: dict[str, list[str]] = {}
+        unlock_keys: dict[str, list[str]] = {}
         scfg = getattr(self.audio.bank, "scfg", None)
         if scfg is not None:
-            for key, name in scfg.hotkey_map().items():
-                key = norm_spec(key)
-                if not key or key in seen:
+            # 两个来源合起来：当前轮盘上的绑定 + 勾了「全局通用」的跨轮盘绑定。
+            # 同一个键上挂多个音效本来就是允许的（各按自己的触发方式走），
+            # 所以这里只做去重，不引入"谁优先"。
+            try:
+                pairs = list(scfg.hotkey_groups().items())
+            except Exception:
+                pairs = []
+            try:
+                pairs += list(scfg.global_hotkey_groups().items())
+            except Exception as exc:
+                _log(f"[bind] 读全局快捷键失败: {exc}")
+            for key, names in pairs:
+                k = norm_spec(key)
+                if not k or k in seen or not names:
                     continue
-                bindings.append((key, lambda n=name: self.audio.play_named(n)))
-                seen.add(key)
+                bucket = by_key.setdefault(k, [])
+                for n in names:
+                    if n not in bucket:
+                        bucket.append(n)
+            for key, names in scfg.unlock_groups().items():
+                k = norm_spec(key)
+                if k and names:
+                    unlock_keys.setdefault(k, []).extend(names)
 
-        self._extra = bindings
+        self._actions = actions
         # 记下当前状态，避免刚绑定就立刻误触发
-        self._extra_prev = {k: self._down(k) for k, _a in bindings}
+        self._action_prev = {k: self._down(k) for k, _a in actions}
+        self._by_key = by_key
+        self._key_prev = {k: self._down(k) for k in by_key}
+        self._unlock_keys = unlock_keys
+        self._unlock_prev = {k: self._down(k) for k in unlock_keys}
+        self._repeat_next.clear()
+        # 换了绑定/参数，旧的解锁授权不该继续有效（否则改完设置还能偷偷按响）
+        self._unlock.clear()
+
+    # ---- 条件解锁 ----
+    def _setting(self, name: str):
+        """取某个音效的配置（没有配置时给一份默认值：点击触发 + 无条件）。
+
+        用 setting_any() 而不是 setting()：勾了「全局通用」的音效可能来自
+        另一套轮盘，当前轮盘的 items 里没有它，直接查会造出一份默认值，
+        音量/变调/长按方式全变默认。
+        """
+        scfg = getattr(self.audio.bank, "scfg", None)
+        if scfg is None:
+            return SoundSetting()
+        try:
+            return scfg.setting_any(name)
+        except Exception:
+            return scfg.setting(name)
+
+    def _grant_unlock(self, names: list[str], now: float) -> None:
+        """按一下解锁键：把名下音效的"可用状态"重置。
+
+        重复按是**刷新**，不是叠加 —— 连按三下不会攒出三次机会。
+        解锁时间 0 = 不设期限（一直有效，直到次数用完）；
+        解锁次数 0 = 不限次（只看时间）。
+        """
+        n = 0
+        for name in names:
+            st = self._setting(name)
+            if st.unlock_mode != UNLOCK_KEY or not st.unlock_key:
+                continue
+            ms = int(st.unlock_ms)
+            deadline = now + ms / 1000.0 if ms > 0 else float("inf")
+            cnt = int(st.unlock_count)
+            self._unlock[name] = [deadline, -1.0 if cnt <= 0 else float(cnt)]
+            n += 1
+        if DEBUG and n:
+            _log(f"[unlock] 放开 {n} 个音效")
+
+    def _unlock_ok(self, name: str, now: float) -> bool:
+        """这个音效此刻能不能触发（只看，不扣次数）。"""
+        info = self._unlock.get(name)
+        if info is None:
+            return False
+        if now > info[0]:
+            self._unlock.pop(name, None)      # 过期了：清掉，别一直挂在表里
+            return False
+        return info[1] < 0 or info[1] >= 1
+
+    def _take_unlock(self, name: str, now: float) -> bool:
+        """能触发就扣一次并返回 True。
+
+        扣次数发生在"真的要响了"的那一刻：长按触发在按下扣，松手触发在
+        松手扣。长按连续触发整段按住只扣 1 次 —— 这正是用户要的：
+        "长按住只会消耗一次解锁次数"。
+        """
+        st = self._setting(name)
+        if st.unlock_mode != UNLOCK_KEY or not st.unlock_key:
+            return True       # 没设条件；选了条件却没设键，也当无条件（别把人锁死）
+        if not self._unlock_ok(name, now):
+            if DEBUG:
+                _log(f"[unlock] {name} 未解锁，忽略这次按下")
+            return False
+        info = self._unlock.get(name)
+        if info is not None and info[1] > 0:
+            info[1] -= 1.0
+            if DEBUG and info[1] <= 0:
+                _log(f"[unlock] {name} 次数用完，重新锁上")
+        return True
+
+    # ---- 长按触发的声音编号 ----
+    def _new_token(self) -> int:
+        fn = getattr(self.audio, "new_token", None)
+        return int(fn()) if callable(fn) else 0
+
+    def _stop_hold(self, name: str) -> None:
+        """松手：把这次按住放出去的声音整批停掉。"""
+        token = self._hold_token.pop(name, 0)
+        if not token:
+            return
+        fn = getattr(self.audio, "stop_token", None)
+        if callable(fn):
+            fn(token)
+
+    def _stop_holds(self) -> None:
+        for name in list(self._hold_token):
+            self._stop_hold(name)
+
+    def _call_play(self, name: str, token: int = 0) -> None:
+        if token:
+            self.audio.play_named(name, token)
+        else:
+            self.audio.play_named(name)
+
+    def _tick_unlock_keys(self) -> None:
+        """解锁键：按下的那一下授权，按住不放不会连续刷。"""
+        now = time.monotonic()
+        for key, names in self._unlock_keys.items():
+            d = self._down(key)
+            if d and not self._unlock_prev.get(key, False):
+                self._grant_unlock(names, now)
+            self._unlock_prev[key] = d
+
+    def _tick_bindings(self, wheel_open: bool = False) -> None:
+        """音效快捷键：一个键可能挂着好几个音效，逐个按各自的触发方式走。"""
+        if self.user_paused:
+            # 暂停了就别让长按的声音一直挂着（用户看不到任何提示，会以为卡死）
+            self._stop_holds()
+            self._repeat_next.clear()
+        now = time.monotonic()
+        for key, names in self._by_key.items():
+            down = self._down(key)
+            prev = self._key_prev.get(key, False)
+            for name in names:
+                self._run_bind(name, key, down, prev, now, wheel_open)
+            self._key_prev[key] = down
+
+    def _run_bind(self, name: str, key: str, down: bool, prev: bool,
+                  now: float, wheel_open: bool = False) -> None:
+        """单个音效的按下/按住/松手处理。
+
+        四种触发方式都在这一个地方分支，状态只有"上一帧按着没"一个，
+        所以不会出现"按着按着就乱了"这种累积状态问题。
+        """
+        st = self._setting(name)
+        mode = str(getattr(st, "trigger_mode", TRIGGER_TAP) or TRIGGER_TAP)
+
+        # 暂停中不响应；轮盘弹着的时候按鼠标左/右键那是"取消呼出"，
+        # 也不该顺手放个音效出来
+        blocked = self.user_paused or (wheel_open and key in WHEEL_CANCEL_KEYS)
+
+        # ---- 松手触发：按下什么都不做，松手那一下才响 ----
+        if mode == TRIGGER_RELEASE:
+            if prev and not down and not blocked:
+                if self._take_unlock(name, now):
+                    self._call_play(name)
+            return
+
+        # ---- 刚按下 ----
+        if down and not prev:
+            # 无论这次能不能响，连发计划都先清掉：
+            # 留着上一轮的旧时刻，接下来的按住会立刻"补发"一串
+            self._repeat_next.pop(name, None)
+            if blocked:
+                return
+            if not self._take_unlock(name, now):
+                return
+            if mode == TRIGGER_HOLD:
+                token = self._new_token()
+                if token:
+                    self._hold_token[name] = token
+                self._call_play(name, token)
+            else:
+                self._call_play(name)
+            if mode == TRIGGER_REPEAT:
+                self._repeat_next[name] = now + self._repeat_gap(st)
+            return
+
+        # ---- 一直按着：只有"长按连续触发"需要再来一次 ----
+        if down and prev:
+            if mode != TRIGGER_REPEAT or blocked or name not in self._repeat_next:
+                return
+            at = self._repeat_next[name]
+            if now < at:
+                return
+            # 用"上次计划时刻 + 间隔"推进（不是 now），卡顿之后不会一次补发一串
+            self._repeat_next[name] = at + self._repeat_gap(st)
+            # 继续连发不再扣解锁：整段按住只算 1 次
+            self._call_play(name)
+            return
+
+        # ---- 松手 ----
+        if prev and not down:
+            if mode == TRIGGER_HOLD:
+                self._stop_hold(name)     # 松手即停
+            self._repeat_next.pop(name, None)
+
+    @staticmethod
+    def _repeat_gap(st) -> float:
+        try:
+            ms = int(getattr(st, "repeat_ms", 200))
+        except Exception:
+            ms = 200
+        return max(REPEAT_MS_MIN, min(REPEAT_MS_MAX, ms)) / 1000.0
 
     def start(self) -> None:
         self._timer.start()
 
     def tick(self) -> None:
+        # 这一帧开始时轮盘是不是开着。鼠标键在轮盘开着时按下去 = "取消呼出"，
+        # 取消的同时轮盘已经关了，所以必须现在记下来，否则后面的音效绑定
+        # 会以为"轮盘没开"，顺手把音效放出来。
+        wheel_open = bool(getattr(self.wheel, "active", False))
         # 鼠标左右键的"刚按下"检测每帧都要跑：暂停期间也要跟上状态，
         # 否则恢复时第一次点击会被当成新按下
         mouse_pressed = False
@@ -4475,8 +4840,16 @@ class InputPoller(QObject):
             # 暂停期间同步状态，恢复时不会把"暂停前按住"当成新按下
             self._prev = self._down(self.hotkey_name)
             self._press_at = time.monotonic()
-            for key, _a in self._extra:
-                self._extra_prev[key] = self._down(key)
+            for key, _a in self._actions:
+                self._action_prev[key] = self._down(key)
+            for key in self._by_key:
+                self._key_prev[key] = self._down(key)
+            for key in self._unlock_keys:
+                self._unlock_prev[key] = self._down(key)
+            # 长按触发的声音不会因为"切去设置窗口"就自己停：这里主动掐掉，
+            # 否则用户改完设置回来，发现有个声音一直在响
+            self._stop_holds()
+            self._repeat_next.clear()
             # 轮盘正弹着的时候切到设置窗口：先把它收掉。
             # 这里每帧会直接 return，不收的话轮盘会一直挂在屏幕上下不来。
             if self.wheel.active:
@@ -4537,12 +4910,17 @@ class InputPoller(QObject):
 
         self._tick_switch()
 
-        # 额外快捷键：只在"按下的那一下"触发，按住不会连发
-        for key, action in self._extra:
+        # 全局一击动作：只在"按下的那一下"触发，按住不会连发
+        for key, action in self._actions:
             d = self._down(key)
-            if d and not self._extra_prev.get(key, False) and not self.user_paused:
+            if d and not self._action_prev.get(key, False) and not self.user_paused:
                 action()
-            self._extra_prev[key] = d
+            self._action_prev[key] = d
+
+        # 解锁键先判（同一帧按下的解锁键应该立刻生效，别让音效白按一次）
+        self._tick_unlock_keys()
+        # 音效快捷键（一个键可能挂着好几个音效，各自按自己的触发方式走）
+        self._tick_bindings(wheel_open)
 
 
 # ---------------------------------------------------------------- 托盘
