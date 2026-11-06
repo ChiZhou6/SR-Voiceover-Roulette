@@ -1219,6 +1219,24 @@ class SoundsConfig:
         key = self.canon(name)
         cur = self.cur_wheel()
         st = cur.items.get(key)
+        if is_combo_key(key):
+            # 组合的定义是全盘共用的，但「全局通用」这个勾记在各套轮盘的 items 里。
+            # hotkey_groups() 每轮都会为组合在当前盘顺手建一条记录（热键为空），
+            # 那条空壳不能当真：真正的触发方式/解锁条件在勾了全局的那一套里，
+            # 直接返回它会把参数读成默认值，解锁键就白设了。
+            if st is not None and getattr(st, "global_hotkey", False):
+                return st
+            for w in self.wheels:
+                if w.wid == cur.wid:
+                    continue
+                other = (w.items or {}).get(key)
+                if other is not None and getattr(other, "global_hotkey", False):
+                    return other
+            if st is not None:
+                return st
+            st = SoundSetting()
+            cur.items[key] = st
+            return st
         if st is not None:
             return st
         for w in self.wheels:

@@ -174,6 +174,72 @@ check(wheel.shown == shown_before + 1, "恢复后长按又能弹出（不是永�
       f"shown={wheel.shown}")
 
 print()
+print("=== C 用户暂停期间，切换轮盘的键照常能用 ===")
+
+
+class FakeSwitcher:
+    """只回答"开没开"，commit 时返回选中的那套。"""
+
+    def __init__(self, pick="w2"):
+        self.active = False
+        self.pick = pick
+        self.shown = 0
+        self.polls = 0
+
+    def show_wheel(self):
+        self.shown += 1
+        self.active = True
+
+    def commit(self):
+        self.active = False
+        return self.pick
+
+    def poll_selection(self):
+        self.polls += 1
+
+
+cfg2 = dict(sr.DEFAULT_CONFIG)
+cfg2["hotkey"] = "y"
+cfg2["switch_key"] = "f8"
+cfg2["hold_ms"] = 60
+wheel2 = FakeWheel()
+sw = FakeSwitcher("w2")
+poller2 = sr.InputPoller(cfg2, wheel2, FakeAudio(), sw)
+picked = []
+poller2.on_switch_wheel = lambda wid: picked.append(wid)
+
+kstate = {"f8": False}
+poller2._down = lambda name: kstate.get(name, False)
+poller2.paused = lambda: False
+
+# 先进入用户暂停（轮盘中心松手那种）
+poller2.set_user_pause(True)
+check(poller2.user_paused is True, "已进入用户暂停")
+
+# 按住切换键够久 —— 暂停不该挡住它
+kstate["f8"] = True
+poller2.tick()
+time.sleep(0.08)
+poller2.tick()
+check(sw.shown == 1, "暂停期间长按切换键仍能弹出切换器", f"shown={sw.shown}")
+
+# 松手提交
+kstate["f8"] = False
+poller2.tick()
+check(picked == ["w2"], "松手后真的切到了另一套", str(picked))
+check(poller2.user_paused is True, "切换轮盘不会顺手解除暂停")
+
+# 设置窗口占着键盘时仍然要挡（那是另一回事，不该被这次改动放开）
+kstate["f8"] = False
+poller2.tick()
+poller2.paused = lambda: True
+kstate["f8"] = True
+poller2.tick()
+time.sleep(0.08)
+poller2.tick()
+check(sw.shown == 1, "设置窗口在前台时，切换键照旧不响应", f"shown={sw.shown}")
+
+print()
 print(f"通过 {len(OK)} 项，失败 {len(BAD)} 项")
 if BAD:
     print("失败项：" + "；".join(BAD))

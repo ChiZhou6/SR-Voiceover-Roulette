@@ -3682,6 +3682,8 @@ class HelpPage(QWidget):
                 "长按 Y（默认 0.25 秒）→ 轮盘出现 → 鼠标划方向 → 松开就播。\n"
                 "圆点在正中松手：正在响就停掉，同时软件进入暂停（所有快捷键暂时失效）。"
                 "解除有两条路：再按住热键、在中心松手一次；或者直接在轮盘上选个音效，播完顺手就恢复了。\n"
+                "暂停期间轮盘键和「切换轮盘」的键都照常能用（它们不发声，不算破例），"
+                "换一套轮盘之后仍然是暂停状态，不会把暂停顺手解掉。\n"
                 "轮盘弹着时点鼠标左键 / 右键：立刻收起，什么都不播，这一按也不会再弹。\n"
                 "单击 Y：直接重播上一个，不开轮盘。",
             ),
@@ -3793,7 +3795,9 @@ class HelpPage(QWidget):
             "· 勾了之后，它的音量、变调、长按方式仍然按它自己那套轮盘的设置来，"
             "不会因为切了轮盘就变回默认值。\n"
             "· 没绑快捷键时勾了也不起作用，鼠标停在勾选框上会有提示。\n"
-            "· 组合音效没有这一项：组合本来就是所有轮盘共用，专属热键天然全局。\n"
+            "· 组合音效也有这一项。组合的定义是所有轮盘共用的，但它绑的那个键"
+            "在别的轮盘上还算不算数，仍然单独决定 —— 勾上之后，在别的轮盘按它"
+            "也能把这条组合放出来。\n"
             "· 如果这个键同时被「呼出轮盘」「重复上一个」这类全局键占着，"
             "音效仍然会让路（按下不响），「快捷键」页顶部会标出来。"
         )
@@ -4418,7 +4422,8 @@ class SlotDetail(QFrame):
         win_row.addWidget(hl)
         self.hotkey = KeyBox("", 116)
         win_row.addWidget(self.hotkey)
-        # 全局通用：勾上之后这个键不再跟着轮盘走（组合本身就不分轮盘，见下面）。
+        # 全局通用：勾上之后这个键不再跟着轮盘走。组合音效也有这一项 ——
+        # 组合的定义全盘共用，但"这个键在别的盘上还算不算数"仍然要单独决定。
         # 文字用两字"全局"：这一行元素已经排满（连击窗口 + 快捷键 + 清除键），
         # 四字在最小窗口下会把按键框挤扁，完整说明放提示里。
         self.chk_global = QCheckBox("全局")
@@ -4427,8 +4432,7 @@ class SlotDetail(QFrame):
             "「全局通用」：勾上之后，这个快捷键不再跟着轮盘走，\n"
             "切换到别的轮盘，按这个键照样能触发它。\n"
             "不勾的时候只在它所在的这一套轮盘上生效（和以前一样）。\n"
-            "没绑快捷键时这一项不起作用。\n"
-            "组合音效本来就是全轮盘共用，没有这个开关。"
+            "没绑快捷键时这一项不起作用。"
         )
         win_row.addWidget(self.chk_global)
         body.addLayout(win_row)
@@ -4666,8 +4670,9 @@ class SlotDetail(QFrame):
                       self.lbl_rand_hint, self.lbl_fixed_hint):
                 w.setVisible(False)
             self.lbl_combo_hint.setVisible(self.current is not None)
-            # 组合的专属热键本来就是全轮盘共用，没有"跟不跟轮盘走"这回事
-            self.chk_global.setVisible(False)
+            # 组合的变调/变速不在这儿管，但"全局通用"照样要有：
+            # 组合的定义全盘共用 != 它的快捷键每套轮盘都认。
+            self.chk_global.setVisible(True)
             return
         # 普通音效：先把组合模式藏掉的那批"无条件放回来"，再按当前模式做减法。
         # 隐藏是粘性的 —— 只要没显式 setVisible(True)，控件就永远不再出现，
@@ -4718,8 +4723,7 @@ class SlotDetail(QFrame):
             self.chk_global.setToolTip(
                 "「全局通用」：勾上之后，这个快捷键不再跟着轮盘走，\n"
                 "切换到别的轮盘，按这个键照样能触发它。\n"
-                "不勾的时候只在它所在的这一套轮盘上生效（和以前一样）。\n"
-                "组合音效本来就是全轮盘共用，没有这个开关。"
+                "不勾的时候只在它所在的这一套轮盘上生效（和以前一样）。"
             )
 
     def _emit_edit_combo(self) -> None:
@@ -4741,6 +4745,7 @@ class SlotDetail(QFrame):
         if self._is_combo:
             # 组合没有"整体变调/速度"这回事，逐项参数归编辑器管
             st.hotkey = self.hotkey.key_name
+            st.global_hotkey = bool(self.chk_global.isChecked())
             self.vol_val.setText(f"{self.volume.value()}%")
             self.setting_changed.emit(self.current)
             return

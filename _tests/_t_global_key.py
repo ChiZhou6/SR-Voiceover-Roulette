@@ -285,14 +285,27 @@ disk = sr.SoundsConfig(sr.SOUNDS_CONFIG_PATH)
 disk.load()
 check(disk.setting(target).global_hotkey is False, "取消勾选也写盘")
 
-# 组合音效：不该出现这个开关（组合的热键本来就是全轮盘共用）
+# 组合音效：也要有这个开关（组合的定义全盘共用，但这个键在别的盘还算不算数，得单独决定）
 cd = sc.ComboDef(cid="ctest", name="测试组合",
                  items=[sc.ComboItem(sound=all_keys[0])]).clamped()
 scfg_ui.combos["ctest"] = cd
 detail.set_sound(sr.combo_key("ctest") if hasattr(sr, "combo_key")
                  else "combo::ctest")
 app.processEvents()
-check(not detail.chk_global.isVisible(), "组合音效隐藏「全局通用」")
+check(detail.chk_global.isVisible(), "组合音效也显示「全局通用」")
+
+# 勾上要真的写进盘里，而不是只停在界面上
+detail.hotkey.set_key("f8")
+app.processEvents()
+detail.chk_global.setChecked(True)
+app.processEvents()
+disk = sr.SoundsConfig(sr.SOUNDS_CONFIG_PATH)
+disk.load()
+ck = sr.combo_key("ctest") if hasattr(sr, "combo_key") else "combo::ctest"
+check(disk.setting(ck).global_hotkey is True, "组合的勾选也写盘",
+      str(disk.setting(ck).global_hotkey))
+check(disk.global_hotkey_groups().get("f8") == [ck], "组合进了全局键表",
+      str(disk.global_hotkey_groups()))
 
 # 换回普通音效：开关要重新出现（隐藏是粘性的，容易忘记还原）
 detail.set_sound(target)
@@ -308,6 +321,117 @@ tip = detail.chk_global.toolTip()
 check("还没绑" in tip or "暂时不会生效" in tip, "空键时提示会说明不生效", tip[:40])
 
 win.close()
+
+
+print("\n=== F. 组合音效也能全局通用 ===")
+# 组合的定义是全盘共用的，但"这个键在别的盘还算不算数"仍然记在各套轮盘的 items 里。
+# 这里盯两件事：切盘后键还要在，以及参数不能被当前盘的空壳盖成默认值。
+cfg3 = fresh_scfg()
+ck = sr.combo_key("cx") if hasattr(sr, "combo_key") else "combo::cx"
+w1 = cfg3.cur_wheel()
+w1.items[ck] = sc.SoundSetting(
+    hotkey="f8", global_hotkey=True,
+    trigger_mode=sc.TRIGGER_HOLD, unlock_mode=sc.UNLOCK_KEY,
+    unlock_key="g", unlock_ms=3000, unlock_count=2,
+)
+cfg3.combos["cx"] = sc.ComboDef(cid="cx", name="跨盘组合",
+                                items=[sc.ComboItem(sound=all_keys[0])]).clamped()
+
+check(cfg3.global_hotkey_groups().get("f8") == [ck], "组合进了全局键表",
+      str(cfg3.global_hotkey_groups()))
+
+cfg3.switch_wheel("w2")
+# 模拟 hotkey_groups() 在别的盘顺手建出来的空壳记录
+w2 = cfg3.cur_wheel()
+w2.items[ck] = sc.SoundSetting()
+check((cfg3.hotkey_groups().get("f8") or []) == [], "当前盘本来没有这个键",
+      str(cfg3.hotkey_groups()))
+check(cfg3.global_hotkey_groups().get("f8") == [ck], "换了一套轮盘，键还在",
+      str(cfg3.global_hotkey_groups()))
+
+got = cfg3.setting_any(ck)
+check(got.trigger_mode == sc.TRIGGER_HOLD, "参数取的是勾全局那一套（触发方式）",
+      got.trigger_mode)
+check(got.unlock_mode == sc.UNLOCK_KEY and got.unlock_key == "g"
+      and got.unlock_ms == 3000, "解锁条件也跟着过去了",
+      f"{got.unlock_mode}/{got.unlock_key}/{got.unlock_ms}")
+check(ck in cfg3.unlock_groups().get("g", []), "解锁键在别的盘也认这个组合",
+      str(cfg3.unlock_groups()))
+
+# 没勾全局的组合：换盘之后就该消失，别把"全盘共用"理解成"所有键都能跨盘"
+cfg4 = fresh_scfg()
+ck2 = sr.combo_key("cy") if hasattr(sr, "combo_key") else "combo::cy"
+cfg4.cur_wheel().items[ck2] = sc.SoundSetting(hotkey="f9", global_hotkey=False)
+cfg4.combos["cy"] = sc.ComboDef(cid="cy", name="只在当前盘",
+                                items=[sc.ComboItem(sound=all_keys[1])]).clamped()
+cfg4.switch_wheel("w2")
+check("f9" not in cfg4.global_hotkey_groups(), "没勾全局的组合换盘后不生效",
+      str(cfg4.global_hotkey_groups()))
+
+
+# 按键绑定层：换盘之后这个键还得真的挂得上、按得响
+class _FakeWheel:
+    active = False
+    raw = None
+
+    def show_wheel(self):
+        pass
+
+    def hide_wheel(self):
+        pass
+
+    def commit(self):
+        return None
+
+    def poll_selection(self):
+        pass
+
+    def reload_entries(self):
+        pass
+
+
+class _FakeAudio:
+    def __init__(self, cfgs):
+        self.bank = SimpleNamespace(scfg=cfgs)
+        self.played = []
+
+    def play(self, i):
+        pass
+
+    def play_named(self, n, token=0):
+        self.played.append(n)
+
+    def play_repeat_last(self):
+        return False
+
+    def play_next(self):
+        return False
+
+    def stop_all(self):
+        pass
+
+    def reset_pitch(self):
+        pass
+
+
+pcfg = dict(sr.DEFAULT_CONFIG)
+pcfg["hotkey"] = "y"
+a_c = _FakeAudio(cfg3)
+p_c = sr.InputPoller(pcfg, _FakeWheel(), a_c, None)
+check(ck in (p_c._by_key.get("f8") or []), "组合的全局键进了绑定表",
+      str(p_c._by_key.get("f8")))
+
+kst = {"f8": False, "g": False}
+p_c._down = lambda n: kst.get(n, False)
+# 这条组合在别的盘上设了"条件解锁"（解锁键 g），先解锁才能响
+kst["g"] = True
+p_c.tick()
+kst["g"] = False
+p_c.tick()
+kst["f8"] = True
+p_c.tick()
+check(ck in a_c.played, "在别的轮盘上按这个键，组合真的被放出来", str(a_c.played))
+
 print("\n" + "=" * 60)
 print(f"通过 {len(OK)} 项，失败 {len(BAD)} 项")
 if BAD:

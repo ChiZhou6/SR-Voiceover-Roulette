@@ -4241,7 +4241,7 @@ class PauseToast(QWidget):
         f2.setPointSize(9)
         p.setFont(f2)
         p.setPen(QPen(QColor(150, 158, 172, 240)))
-        hint = "快捷键暂时失效，长按轮盘键可恢复" if self.paused else "快捷键可以用了"
+        hint = "音效键失效，长按轮盘键可恢复" if self.paused else "快捷键可以用了"
         p.drawText(
             QRectF(pill.left() + 48, pill.top() + 26, pill.width() - 58, 20),
             Qt.AlignLeft | Qt.AlignVCenter,
@@ -4492,7 +4492,8 @@ class InputPoller(QObject):
     def set_user_pause(self, on: bool) -> None:
         """进入/退出用户暂停。
 
-        暂停期间只挡"轻按动作"和额外快捷键，**轮盘本身照常能长按打开**。
+        暂停期间只挡"轻按动作"和额外快捷键，**轮盘本身照常能长按打开**，
+        切换轮盘的键也照常能用（见 _tick_switch）。
         这是故意留的活路：如果连轮盘都挡住，用户被自己暂停了就再也没办法
         用键盘解除，只能去托盘右键退出程序。
         """
@@ -4511,13 +4512,17 @@ class InputPoller(QObject):
 
         和主热键同一套手感：要按满 hold_ms 才弹，轻点一下不会弹
         （这个键没有"轻按动作"，误触比漏触更烦人）。
+
+        用户自己暂停（user_paused）时不挡这个键 —— 暂停挡的是"会出声的东西"，
+        切换轮盘本身不出声，而且暂停期间换盘是正常操作（想换个盘再选音效恢复）。
+        真正要挡的是设置窗口占着键盘那种临时让路，那是另一回事。
         """
         sw = self.switcher
         key = norm_spec(self.cfg.get("switch_key", ""))
         if sw is None or not key or key == self.hotkey_name:
             self._sw_prev = False
             return
-        if self.user_paused or (self.paused is not None and self.paused()):
+        if self.paused is not None and self.paused():
             self._sw_prev = self._down(key)
             self._sw_at = time.monotonic()
             return
