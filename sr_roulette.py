@@ -4250,6 +4250,200 @@ class PauseToast(QWidget):
         p.end()
 
 
+class HintToast(QWidget):
+    """程序自己的提示条，替代 QSystemTrayIcon.showMessage。
+
+    为什么不用托盘气泡：Windows 10/11 会把气泡转成系统通知，**默认带一声
+    提示音**，而且这个声音只能去系统设置里关，Qt 没有"只显示不发声"的开关。
+    切轮盘、重扫目录这类动作每次都叮一声，用久了很烦。
+
+    这里自己画一条：置顶、整窗鼠标穿透、不抢焦点、透明度跟着「轮盘 → 不透明度」，
+    显示两三秒自己淡出。全程不出声，也不会在通知中心留一堆历史。
+    """
+
+    LEVEL_MS = {"info": 2000, "warn": 3200, "error": 4200}
+
+    def __init__(self, cfg: dict) -> None:
+        super().__init__(
+            None,
+            Qt.Tool
+            | Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.WindowDoesNotAcceptFocus,
+        )
+        self.cfg = cfg
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.text = ""
+        self.level = "info"
+        self.t = 0.0
+        self._anim: QVariantAnimation | None = None
+        self._last_text = ""
+        self._last_at = 0.0
+        self.setFixedSize(320, 64)
+
+    # ---- 样式 ----
+    def apply_style(self) -> None:
+        try:
+            hwnd = int(self.winId())
+            style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            style |= WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+        except Exception as exc:
+            _log(f"[hint] 设置提示窗样式失败: {exc}")
+
+    def _tint(self, a: int = 235) -> QColor:
+        if self.level == "warn":
+            return QColor(240, 166, 62, a)
+        if self.level == "error":
+            return QColor(236, 94, 94, a)
+        return accent(a)
+
+    @staticmethod
+    def _text_font() -> QFont:
+        f = QFont(UI_FONT)
+        f.setPointSize(10)
+        return f
+
+    def width_for(self, text: str) -> int:
+        w = QFontMetrics(self._text_font()).horizontalAdvance(text)
+        return max(260, min(540, w + 88))
+
+    # ---- 显示 ----
+    def show_hint(self, text: str, level: str = "info",
+                  hold_ms: int | None = None) -> None:
+        """弹一条提示。level = info / warn / error，只影响配色和默认停留时长。"""
+        text = str(text or "").strip()
+        if not text:
+            return
+        # 同一句话短时间内不重复弹：麦克风抖动时 problem 信号可能连着来几趟，
+        # 每趟都重新播一遍动画会变成一直在闪，比不提示还烦。
+        now = time.monotonic()
+        if text == self._last_text and now - self._last_at < 6.0:
+            return
+        self._last_text = text
+        self._last_at = now
+
+        self.text = text
+        self.level = level if level in self.LEVEL_MS else "info"
+        hold = int(hold_ms) if hold_ms else self.LEVEL_MS[self.level]
+
+        w = self.width_for(text)
+        self.setFixedSize(w, 64)
+
+        sx, sy = cursor_pos()
+        screen = QApplication.screenAt(QPoint(sx, sy)) or QApplication.primaryScreen()
+        geo = screen.geometry() if screen else None
+        if geo is not None:
+            x = geo.center().x() - w // 2
+            # 和暂停提示同一条"视线边缘"：屏幕自上往下 3/4，不压准星
+            y = geo.top() + int(geo.height() * 0.75) - 32
+            self.setGeometry(x, y, w, 64)
+
+        if self._anim is not None:
+            self._anim.stop()
+        self.apply_style()
+        self.show()
+        self.raise_()
+
+        # 关了动画就静止显示，到点直接消失：不淡入淡出也不缩放。
+        # 提示条和"暂停提示"不一样 —— 那个没动画就什么都不显示，
+        # 这里要保证信息还在（可能是麦克风坏了这种要紧事）。
+        if not bool(self.cfg.get("animations", True)):
+            self.t = 0.5
+            self.update()
+            QTimer.singleShot(hold, self.hide)
+            return
+
+        self.t = 0.0
+        a = QVariantAnimation(self)
+        a.setStartValue(0.0)
+        a.setEndValue(1.0)
+        a.setDuration(max(700, hold + 520))
+        a.setEasingCurve(QEasingCurve.Linear)
+        a.valueChanged.connect(self._on_tick)
+        a.finished.connect(self.hide)
+        self._anim = a
+        a.start()
+
+    def _on_tick(self, v) -> None:
+        self.t = float(v)
+        self.update()
+
+    # ---- 绘制 ----
+    def paintEvent(self, event) -> None:  # noqa: N802
+        t = max(0.0, min(1.0, self.t))
+        # 时间轴：开头 10% 冒出来，最后 14% 淡出，中间停住
+        if t < 0.10:
+            k = t / 0.10
+            appear = 1.0 - (1.0 - k) ** 3
+            alpha = k
+            rise = (1.0 - appear) * 8.0
+        elif t > 0.86:
+            k = (t - 0.86) / 0.14
+            appear = 1.0
+            alpha = 1.0 - k
+            rise = k * 5.0
+        else:
+            appear = 1.0
+            alpha = 1.0
+            rise = 0.0
+        if alpha <= 0.003:
+            return
+
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setRenderHint(QPainter.TextAntialiasing, True)
+        # 和轮盘/暂停提示共用同一个透明度设置，三处观感一致
+        ui_opacity = float(self.cfg.get("opacity", 0.94) or 0.94)
+        p.setOpacity(max(0.05, min(1.0, alpha * ui_opacity)))
+
+        cx, cy = self.width() / 2.0, self.height() / 2.0
+        scale = 0.94 + 0.06 * appear
+        p.translate(cx, cy + rise)
+        p.scale(scale, scale)
+        p.translate(-cx, -cy)
+
+        pill = QRectF(8, 14, self.width() - 16, 36)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(0, 0, 0, 70))
+        p.drawRoundedRect(pill.adjusted(-1, 2, 1, 3), 18, 18)
+        p.setBrush(QColor(18, 20, 26, 240))
+        p.setPen(QPen(self._tint(210), 1.4))
+        p.drawRoundedRect(pill, 18, 18)
+
+        # ---- 左边那个小标记：info 是圆点，warn/error 是带符号的圆 ----
+        tint = self._tint(245)
+        ix = pill.left() + 20
+        iy = pill.center().y()
+        p.setPen(Qt.NoPen)
+        p.setBrush(tint)
+        if self.level == "info":
+            p.drawEllipse(QPointF(ix, iy), 4.2, 4.2)
+        else:
+            p.drawEllipse(QPointF(ix, iy), 8.5, 8.5)
+            f = QFont(UI_FONT)
+            f.setPointSize(10)
+            f.setBold(True)
+            p.setFont(f)
+            p.setPen(QPen(QColor(18, 20, 26, 250)))
+            p.drawText(QRectF(ix - 8.5, iy - 8.5, 17, 17), Qt.AlignCenter,
+                       "!" if self.level == "warn" else "×")
+
+        # ---- 正文：一行，太长就省略（提示条不该自己长成两行挡住游戏） ----
+        f = self._text_font()
+        p.setFont(f)
+        p.setPen(QPen(QColor(238, 242, 248, 250)))
+        rect = QRectF(pill.left() + 34, pill.top(),
+                      pill.width() - 46, pill.height())
+        el = QFontMetrics(f).elidedText(self.text, Qt.ElideRight,
+                                        int(rect.width()))
+        p.drawText(rect, Qt.AlignLeft | Qt.AlignVCenter, el)
+        p.end()
+
+
 class WheelController(QObject):
     """负责显示/隐藏、虚拟光标推进、选中判定。"""
 
@@ -5016,6 +5210,9 @@ def main() -> int:
 
     # 用户暂停/恢复：改轮盘中心的提示文案，再在屏幕上闪一下
     pause_toast = PauseToast(cfg)
+    # 其余所有提示都走这条无声提示条。不用托盘气泡是因为 Windows 会把气泡
+    # 转成系统通知并带一声提示音，切一次轮盘就叮一下，用久了很烦。
+    hint_toast = HintToast(cfg)
 
     def on_user_pause(on: bool) -> None:
         wheel.widget.paused = bool(on)
@@ -5029,13 +5226,13 @@ def main() -> int:
     tray = QSystemTrayIcon(icon, app)
     tray.setToolTip(f"{APP_NAME} {APP_VERSION}\n长按 {spec_label(cfg['hotkey'])} 打开轮盘")
 
-    # 链路出问题直接弹气泡：设置窗口关着、人在游戏里，也能第一时间知道
+    # 链路出问题就在屏幕上提示：设置窗口关着、人在游戏里，也能第一时间知道
     # （以前只写进设置页那行小字，用户永远看不见，还以为一切正常）
     def on_audio_problem(msg: str) -> None:
-        tray.showMessage(f"{APP_NAME} · 音频", msg, QSystemTrayIcon.Warning, 8000)
+        hint_toast.show_hint(f"音频：{msg}", "warn", 6000)
 
     audio.problem.connect(on_audio_problem)
-    # 托盘图标这会儿还没 show()，气泡会被丢掉，等主循环转起来再补报
+    # 提示条这会儿还没 show() 过，等主循环转起来再补报
     QTimer.singleShot(1500, audio.announce_now)
 
     menu = QMenu()
@@ -5059,8 +5256,7 @@ def main() -> int:
         if win is not None and hasattr(win, "on_wheel_switched"):
             win.on_wheel_switched()
         act_count.setText(f"已加载音效：{len(audio)} 个（上限 {MAX_SLOTS}）")
-        tray.showMessage(APP_NAME, f"已切换到「{name}」",
-                         QSystemTrayIcon.Information, 1500)
+        hint_toast.show_hint(f"已切换到「{name}」")
 
     poller.on_switch_wheel = switch_wheel
 
@@ -5128,10 +5324,7 @@ def main() -> int:
         bank.reload()
         audio.load()
         act_count.setText(f"已加载音效：{len(audio)} 个（上限 {MAX_SLOTS}）")
-        tray.showMessage(
-            APP_NAME, f"已重新载入 {len(audio)} 个音效",
-            QSystemTrayIcon.Information, 2500,
-        )
+        hint_toast.show_hint(f"已重新载入 {len(audio)} 个音效")
 
     act_reload.triggered.connect(do_reload)
     menu.addAction(act_reload)
@@ -5174,24 +5367,17 @@ def main() -> int:
     dev_watch.start()
 
     if len(audio) == 0:
-        tray.showMessage(
-            APP_NAME,
-            "sounds 目录里还没有可用音效。放几个 wav/mp3 进去，再点托盘菜单的「重新扫描」。",
-            QSystemTrayIcon.Warning, 6000,
-        )
+        hint_toast.show_hint(
+            "sounds 目录里还没有可用音效，放几个进去再重新扫描", "warn", 6000)
     else:
-        tray.showMessage(
-            APP_NAME,
-            f"已就绪，长按 {spec_label(cfg['hotkey'])} 打开轮盘（{len(audio)} 个音效）",
-            QSystemTrayIcon.Information, 3000,
-        )
+        hint_toast.show_hint(
+            f"已就绪，长按 {spec_label(cfg['hotkey'])} 打开轮盘"
+            f"（{len(audio)} 个音效）")
 
     if not raw_ok:
-        tray.showMessage(
-            APP_NAME,
-            "鼠标原始输入注册失败，轮盘将无法选择音效。详情见 sr_roulette.log。",
-            QSystemTrayIcon.Critical, 8000,
-        )
+        hint_toast.show_hint(
+            "鼠标原始输入注册失败，轮盘将无法选择音效（详情见日志）",
+            "error", 6000)
 
     return app.exec()
 
