@@ -123,6 +123,25 @@ UNLOCK_MODE_LABEL = {
 
 UNLOCK_MS_MAX = 600000      # 解锁时间上限 10 分钟
 UNLOCK_COUNT_MAX = 999      # 解锁次数上限
+# 条件停止键最多几个：面板一行放得下 3 个 96px 的按键框，
+# 再多就要换行（卡面高度是写死的），而且一个键本来就够用，
+# 多个键只是"顺手哪个都行"的方便
+STOP_KEYS_MAX = 3
+
+
+def _norm_keys(raw) -> list[str]:
+    """把一组按键名收干净：去空格、小写、去重、丢掉空的。
+
+    手写 json 里写成单个字符串（"3"）也认，别让整份配置因为一个字段报废。
+    """
+    if isinstance(raw, str):
+        raw = [raw]
+    out: list[str] = []
+    for k in raw or []:
+        k = str(k or "").strip().lower()
+        if k and k not in out:
+            out.append(k)
+    return out[:STOP_KEYS_MAX]
 
 
 @dataclass
@@ -154,6 +173,11 @@ class SoundSetting:
     unlock_key: str = ""              # 解锁键，空 = 没设（等同于无条件）
     unlock_ms: int = 0                # 解锁有效期，0 = 不限时（直到把次数用完）
     unlock_count: int = 0             # 可用次数，0 = 不限次
+    # 条件停止键：按一下立刻掐掉这个音效正在响的声音，并把它重新锁上。
+    # 可以填好几个（任意一个按下都算）。空列表 = 没设。
+    # 只在"条件解锁"时才有"重新上锁"这层意思，但"按一下就停"对无条件
+    # 音效同样有用，所以不看 unlock_mode，只要设了就生效。
+    stop_keys: list[str] = field(default_factory=list)
 
     def clamped(self) -> "SoundSetting":
         """把越界的值收回来。手改 json 写错了也不至于出怪声。"""
@@ -180,6 +204,7 @@ class SoundSetting:
         s.unlock_key = (s.unlock_key or "").strip().lower()
         s.unlock_ms = max(0, min(UNLOCK_MS_MAX, int(s.unlock_ms)))
         s.unlock_count = max(0, min(UNLOCK_COUNT_MAX, int(s.unlock_count)))
+        s.stop_keys = _norm_keys(s.stop_keys)
         return s
 
 
@@ -1270,6 +1295,76 @@ class SoundsConfig:
                 key = (st.unlock_key or "").strip().lower()
                 if not key:
                     continue      # 选了条件解锁却没设键：当作无条件，别把人锁死
+                bucket = out.setdefault(key, [])
+                if name not in bucket:
+                    bucket.append(name)
+        return out
+
+    def _peek_setting(self, name: str) -> SoundSetting | None:
+        """查音效参数，但**只查不造**（找不到就返回 None）。
+
+        setting_any() 找不到时会顺手在当前轮盘的 items 里造一条默认记录，
+        对"遍历所有组合、看看谁设了停止键"这种扫描是灾难：库里 8 条组合
+        会凭空长出 8 条空记录，sounds.json 越滚越肥。
+        """
+        key = self.canon(name)
+        cur = self.cur_wheel()
+        st = cur.items.get(key)
+        combo = is_combo_key(key)
+        # 当前轮盘有就用它；但组合在别的轮盘勾了「全局通用」时，那条更真实
+        # （当前轮盘里可能只是 hotkey_groups() 顺手造的壳）
+        if st is not None and (not combo or getattr(st, "global_hotkey", False)):
+            return st
+        fallback = st
+        for w in self.wheels:
+            if w.wid == cur.wid:
+                continue
+            other = (w.items or {}).get(key)
+            if other is None:
+                continue
+            if getattr(other, "global_hotkey", False):
+                return other
+            if fallback is None:
+                fallback = other
+        return fallback
+
+    def stop_groups(self) -> dict[str, list[str]]:
+        """返回 {条件停止键: [音效键, ...]}。
+
+        和 unlock_groups() 是一对：解锁键负责"放开"，停止键负责"掐掉并
+        重新上锁"。同一个键按一下会停掉名下所有音效，各自清各自的锁。
+
+        收集范围比 unlock_groups() 更宽：
+        - 当前轮盘上的音效（不管有没有绑触发键 —— 只设停止键、触发靠轮盘
+          点选也是合法用法）
+        - 所有组合（组合的定义全盘共用，没上盘也能绑停止键）
+        - 别的轮盘里勾了「全局通用」的音效（它们在任何一套轮盘上都算数）
+
+        整段只读不写（见 _peek_setting）：每次重建快捷键绑定都会跑一遍，
+        在里面造记录会把 sounds.json 灌满空条目。
+        """
+        out: dict[str, list[str]] = {}
+        cur = self.cur_wheel()
+
+        names: list[str] = []
+        for name in (cur.items or {}):
+            names.append(name)
+        for w in self.wheels:
+            if w.wid == cur.wid:
+                continue
+            for name, st in (w.items or {}).items():
+                if getattr(st, "global_hotkey", False) and name not in names:
+                    names.append(name)
+        for cid in self.combos:
+            key = self.combo_key(cid)
+            if key not in names:
+                names.append(key)
+
+        for name in names:
+            st = self._peek_setting(name)
+            if st is None:
+                continue
+            for key in _norm_keys(getattr(st, "stop_keys", [])):
                 bucket = out.setdefault(key, [])
                 if name not in bucket:
                     bucket.append(name)

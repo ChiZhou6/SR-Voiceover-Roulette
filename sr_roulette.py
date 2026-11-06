@@ -2015,7 +2015,7 @@ class Mixer(QIODevice):
 
     def trigger(self, clip: np.ndarray, gain: float = 1.0, delay: int = 0,
                 group: str | None = None, max_voices: int = 0,
-                token: int = 0) -> bool:
+                token: int = 0, slot: int = -1) -> bool:
         """播放一段波形。直接收 clip 而不是索引，因为变调后的波形是临时算的。
 
         delay 是"再过多少帧才开始响"，组合音效靠它做排程：
@@ -2029,17 +2029,46 @@ class Mixer(QIODevice):
         token 是"这一次触发"的编号（v0.9）。同一次触发的所有声部共用它，
         松手要停的时候按编号一起掐 —— 见 stop_token()。0 表示不参与
         按次停止（普通点击触发就是这样，响了就让它响完）。
+
+        slot 是这段声音属于轮盘上的第几个格子（v0.9.0 条件停止）。
+        存下来是为了"按音效停"：不管它是快捷键按响的、轮盘点响的、
+        还是顺序播放轮到的，都能按这一格找回来一起掐掉。
         """
         if clip is None or len(clip) == 0:
             return False
         if group and max_voices > 0:
             self._retire_oldest(group, max_voices)
         # 同一音效连按两次时叠加播放，不做打断，免得出现截断的尾巴
-        # [波形, 播放位置, 音量, 淡出剩余帧, 延迟剩余帧, 分组, 这次触发的编号]
+        # [波形, 播放位置, 音量, 淡出剩余帧, 延迟剩余帧, 分组, 触发编号, 槽位]
         self.voices.append(
-            [clip, 0, float(gain), 0, max(0, int(delay)), group, int(token)]
+            [clip, 0, float(gain), 0, max(0, int(delay)), group,
+             int(token), int(slot)]
         )
         return True
+
+    def _stop_voices(self, hit, fade_ms: float = 12.0) -> int:
+        """按条件掐掉一批声部，返回真正处理掉的条数。
+
+        fade_ms 默认 12ms：直接清空等于从波形中间"咔嚓"切断，扬声器会蹦出
+        一声爆音（听起来像软件崩了）。还没开口的延迟语音直接摘掉，否则停了
+        一秒钟后还会有声音自己冒出来。
+        """
+        fade = max(0, int(self.rate * fade_ms / 1000.0))
+        kept: list[list] = []
+        n = 0
+        for voice in self.voices:
+            if not hit(voice):
+                kept.append(voice)
+                continue
+            n += 1
+            if len(voice) > 4 and voice[4] > 0:
+                continue          # 还没开口：直接摘掉，不用淡出
+            if fade <= 0:
+                continue          # 立刻切（调用方自己承担爆音）
+            voice[3] = max(1, fade)
+            kept.append(voice)
+        self.voices = kept
+        return n
 
     def stop_token(self, token: int, fade_ms: float = 12.0) -> int:
         """掐掉"某一次触发"产生的全部声部，别的触发一概不碰。
@@ -2050,22 +2079,23 @@ class Mixer(QIODevice):
         """
         if not token:
             return 0
-        fade = max(0, int(self.rate * fade_ms / 1000.0))
-        kept: list[list] = []
-        n = 0
-        for voice in self.voices:
-            if len(voice) < 7 or voice[6] != token:
-                kept.append(voice)
-                continue
-            n += 1
-            if voice[4] > 0:
-                continue          # 还没开口：直接摘掉，不用淡出
-            if fade <= 0:
-                continue          # 立刻切（调用方自己承担爆音）
-            voice[3] = max(1, fade)
-            kept.append(voice)
-        self.voices = kept
-        return n
+        return self._stop_voices(
+            lambda v: len(v) > 6 and v[6] == token, fade_ms
+        )
+
+    def stop_slot(self, slot: int, fade_ms: float = 12.0) -> int:
+        """掐掉"某个格子"放出来的全部声部（条件停止键用）。
+
+        和 stop_token 的区别：token 只管这一次触发，槽位管这个音效的
+        全部发声 —— 快捷键按的、轮盘点的、按住连发的都算，适合
+        "按一下停止键，这个音效立刻闭嘴"。
+        """
+        slot = int(slot)
+        if slot < 0:
+            return 0
+        return self._stop_voices(
+            lambda v: len(v) > 7 and v[7] == slot, fade_ms
+        )
 
     def _retire_oldest(self, group: str, max_voices: int) -> None:
         """这条分组里的声音超过上限时，把最老的几条让出去。
@@ -2739,7 +2769,7 @@ class AudioEngine(QObject):
         # 组合条目：不走普通音效那套连击变调，直接进组合排程
         entry = self.bank.entry_at(idx)
         if isinstance(entry, ComboEntry):
-            ok = self.play_combo(entry.cdef, token=token)
+            ok = self.play_combo(entry.cdef, token=token, slot=idx)
             if ok:
                 self.last_idx = idx
             return ok
@@ -2811,7 +2841,7 @@ class AudioEngine(QObject):
         # 每个出口都要触发一次（波形是同一个，进度各走各的）
         ok = False
         for mix in self._active_mixers():
-            ok = mix.trigger(clip, gain, token=token) or ok
+            ok = mix.trigger(clip, gain, token=token, slot=idx) or ok
         return ok
 
     # ---- 组合播放 ----
@@ -2936,7 +2966,7 @@ class AudioEngine(QObject):
         return ok
 
     def play_combo(self, cdef: ComboDef, from_row: int | None = None,
-                   token: int = 0) -> bool:
+                   token: int = 0, slot: int = -1) -> bool:
         """播放一个组合音效。
 
         步骤只有三步，全部可预期：
@@ -3022,7 +3052,7 @@ class AudioEngine(QObject):
             for mix in self._active_mixers():
                 ok = mix.trigger(clip, gain, delay,
                                  group=cdef.cid, max_voices=max_voices,
-                                 token=token) or ok
+                                 token=token, slot=slot) or ok
         if DEBUG:
             _log(f"[combo] {cdef.name}: 排程 {len(plan)} 项 "
                  + ", ".join(f"#{i + 1}@{d / rate:.2f}s" for i, d in plan))
@@ -3212,6 +3242,27 @@ class AudioEngine(QObject):
             return
         for mix in self._mixers_all():
             mix.stop_token(token)
+
+    def stop_named(self, name: str, fade_ms: float = 12.0) -> int:
+        """掐掉某个音效**此刻**正在响的全部声音（条件停止键用）。
+
+        和 stop_token 的分工：token 认得是"哪一次触发"，所以长按松手用它；
+        停止键要的是"这个音效立刻闭嘴"，不管是快捷键按的、轮盘点响的、
+        还是长按连发出来的，都得一起停 —— 这里按槽位找，一个不漏。
+
+        返回值是真正掐掉的声部数（0 = 本来就没在响），调用方拿它决定
+        要不要打日志。找不到槽位（比如没上轮盘、靠专属热键播的组合）
+        返回 0，那种情况交给 trigger 编号去停。
+        """
+        idx = self.bank.index_of_name(name)
+        if idx < 0:
+            idx = self._global_slots.get(name, -1)
+        if idx < 0:
+            return 0
+        n = 0
+        for mix in self._mixers_all():
+            n += mix.stop_slot(idx, fade_ms)
+        return n
 
     @property
     def playing(self) -> bool:
@@ -4665,6 +4716,13 @@ class InputPoller(QObject):
         self._unlock: dict[str, list[float]] = {}
         self._unlock_keys: dict[str, list[str]] = {}  # 解锁键 -> [音效键, ...]
         self._unlock_prev: dict[str, bool] = {}
+        # ---- 条件停止 ----
+        # 停止键 -> [音效键, ...]；按一下停掉这些音效并重新上锁
+        self._stop_keys: dict[str, list[str]] = {}
+        self._stop_prev: dict[str, bool] = {}
+        # 音效键 -> 最近一次触发的编号（停止键要能把这次的声音一起掐掉；
+        # 没上轮盘、只能靠专属热键播的组合全靠它）
+        self._last_token: dict[str, int] = {}
         # 返回 True 时暂停响应按键（配置窗口打开时用，免得打字把轮盘弹出来）
         self.paused: object = None
         # 用户自己按出来的暂停（轮盘中心松手）。和上面那个"设置窗口占着键盘"
@@ -4799,6 +4857,7 @@ class InputPoller(QObject):
 
         by_key: dict[str, list[str]] = {}
         unlock_keys: dict[str, list[str]] = {}
+        stop_keys: dict[str, list[str]] = {}
         scfg = getattr(self.audio.bank, "scfg", None)
         if scfg is not None:
             # 两个来源合起来：当前轮盘上的绑定 + 勾了「全局通用」的跨轮盘绑定。
@@ -4824,6 +4883,13 @@ class InputPoller(QObject):
                 k = norm_spec(key)
                 if k and names:
                     unlock_keys.setdefault(k, []).extend(names)
+            try:
+                for key, names in scfg.stop_groups().items():
+                    k = norm_spec(key)
+                    if k and names:
+                        stop_keys.setdefault(k, []).extend(names)
+            except Exception as exc:
+                _log(f"[bind] 读条件停止键失败: {exc}")
 
         self._actions = actions
         # 记下当前状态，避免刚绑定就立刻误触发
@@ -4832,7 +4898,10 @@ class InputPoller(QObject):
         self._key_prev = {k: self._down(k) for k in by_key}
         self._unlock_keys = unlock_keys
         self._unlock_prev = {k: self._down(k) for k in unlock_keys}
+        self._stop_keys = stop_keys
+        self._stop_prev = {k: self._down(k) for k in stop_keys}
         self._repeat_next.clear()
+        self._last_token.clear()
         # 换了绑定/参数，旧的解锁授权不该继续有效（否则改完设置还能偷偷按响）
         self._unlock.clear()
 
@@ -4927,6 +4996,22 @@ class InputPoller(QObject):
         else:
             self.audio.play_named(name)
 
+    def _play_triggered(self, name: str, hold: bool = False) -> int:
+        """播一次，并给这一次打上编号。
+
+        编号本来只有"长按松手即停"用；v0.9.0 起每个触发都打上，因为
+        条件停止键要停的是"这个音效此刻在响的声音"。没编号时只能按槽位
+        找（轮盘点响的那种），而靠专属热键播、又没上轮盘的组合没有槽位，
+        就只能靠编号整批掐掉。
+        """
+        tok = self._new_token()
+        if tok:
+            self._last_token[name] = tok
+            if hold:
+                self._hold_token[name] = tok
+        self._call_play(name, tok)
+        return tok
+
     def _tick_unlock_keys(self) -> None:
         """解锁键：按下的那一下授权，按住不放不会连续刷。"""
         now = time.monotonic()
@@ -4935,6 +5020,49 @@ class InputPoller(QObject):
             if d and not self._unlock_prev.get(key, False):
                 self._grant_unlock(names, now)
             self._unlock_prev[key] = d
+
+    # ---- 条件停止 ----
+    def _cut_sound(self, name: str) -> int:
+        """条件停止：立刻掐掉这个音效，并把它重新锁上。
+
+        三件事一起做，缺一个都不是用户要的效果：
+          1. 停声音 —— 按住触发的按编号停（_hold_token），其余按槽位停
+             （stop_named）。只停"这一次"不够：用户点的是"这个音效"，
+             它之前按了几次、叠了几层，都该闭嘴
+          2. 清连发计划 —— 不清的话，手还按着触发键时会按旧时刻再响一次
+          3. 清解锁授权 —— 这就是"重新上锁"，下次要再按解锁键才响
+
+        返回停掉的声部数（0 = 本来没在响，但锁照样清了）。
+        """
+        stopped = 0
+        tokens = {self._hold_token.pop(name, 0), self._last_token.pop(name, 0)}
+        fn_tok = getattr(self.audio, "stop_token", None)
+        if callable(fn_tok):
+            for tok in tokens:
+                if tok:
+                    fn_tok(tok)
+        fn_name = getattr(self.audio, "stop_named", None)
+        if callable(fn_name):
+            try:
+                stopped += int(fn_name(name) or 0)
+            except Exception as exc:
+                _log(f"[stop] 按音效停止失败 {name}: {exc}")
+        self._repeat_next.pop(name, None)
+        locked = name in self._unlock
+        self._unlock.pop(name, None)
+        if DEBUG:
+            _log(f"[stop] {name}：停 {stopped} 路"
+                 + ("，重新上锁" if locked else ""))
+        return stopped
+
+    def _tick_stop_keys(self) -> None:
+        """停止键：只在按下的那一下动手，按住不放不会反复停。"""
+        for key, names in self._stop_keys.items():
+            d = self._down(key)
+            if d and not self._stop_prev.get(key, False):
+                for name in names:
+                    self._cut_sound(name)
+            self._stop_prev[key] = d
 
     def _tick_bindings(self, wheel_open: bool = False) -> None:
         """音效快捷键：一个键可能挂着好几个音效，逐个按各自的触发方式走。"""
@@ -4968,7 +5096,7 @@ class InputPoller(QObject):
         if mode == TRIGGER_RELEASE:
             if prev and not down and not blocked:
                 if self._take_unlock(name, now):
-                    self._call_play(name)
+                    self._play_triggered(name)
             return
 
         # ---- 刚按下 ----
@@ -4980,13 +5108,7 @@ class InputPoller(QObject):
                 return
             if not self._take_unlock(name, now):
                 return
-            if mode == TRIGGER_HOLD:
-                token = self._new_token()
-                if token:
-                    self._hold_token[name] = token
-                self._call_play(name, token)
-            else:
-                self._call_play(name)
+            self._play_triggered(name, hold=(mode == TRIGGER_HOLD))
             if mode == TRIGGER_REPEAT:
                 self._repeat_next[name] = now + self._repeat_gap(st)
             return
@@ -5000,8 +5122,9 @@ class InputPoller(QObject):
                 return
             # 用"上次计划时刻 + 间隔"推进（不是 now），卡顿之后不会一次补发一串
             self._repeat_next[name] = at + self._repeat_gap(st)
-            # 继续连发不再扣解锁：整段按住只算 1 次
-            self._call_play(name)
+            # 继续连发不再扣解锁：整段按住只算 1 次。
+            # 编号沿用这次按住的：停止键一下能把整串连发一起掐掉。
+            self._call_play(name, self._last_token.get(name, 0))
             return
 
         # ---- 松手 ----
@@ -5045,6 +5168,8 @@ class InputPoller(QObject):
                 self._key_prev[key] = self._down(key)
             for key in self._unlock_keys:
                 self._unlock_prev[key] = self._down(key)
+            for key in self._stop_keys:
+                self._stop_prev[key] = self._down(key)
             # 长按触发的声音不会因为"切去设置窗口"就自己停：这里主动掐掉，
             # 否则用户改完设置回来，发现有个声音一直在响
             self._stop_holds()
@@ -5118,6 +5243,10 @@ class InputPoller(QObject):
 
         # 解锁键先判（同一帧按下的解锁键应该立刻生效，别让音效白按一次）
         self._tick_unlock_keys()
+        # 停止键紧随其后：解锁和停止各管一头，同一帧都按着时按顺序来，
+        # 结果是"锁上"（停止键最后说话），这比反过来安全 —— 用户按停止
+        # 的意图是"别响了"，不该被同一帧的解锁又放开。
+        self._tick_stop_keys()
         # 音效快捷键（一个键可能挂着好几个音效，各自按自己的触发方式走）
         self._tick_bindings(wheel_open)
 

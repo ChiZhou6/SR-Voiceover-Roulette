@@ -204,7 +204,7 @@ def main() -> int:
     hk.key_repeat.key_changed.emit("r")
     app.processEvents()
     check(cfg.get("repeat_last_key") == "r", "重复上一个键写入", str(cfg.get("repeat_last_key")))
-    fns = [a for _vk, a in poller._extra]
+    fns = [a for _vk, a in poller._actions]
     check(any(getattr(a, "__name__", "") == "play_repeat_last" for a in fns),
           "轮询器绑上重复上一个", str([getattr(a, '__name__', '?') for a in fns]))
 
@@ -212,7 +212,7 @@ def main() -> int:
     hk.key_cycle.key_changed.emit("t")
     app.processEvents()
     check(cfg.get("cycle_key") == "t", "顺序播放键写入", str(cfg.get("cycle_key")))
-    fns = [a for _vk, a in poller._extra]
+    fns = [a for _vk, a in poller._actions]
     check(any(getattr(a, "__name__", "") == "play_next" for a in fns),
           "轮询器绑上顺序播放", str([getattr(a, '__name__', '?') for a in fns]))
 
@@ -266,8 +266,8 @@ def main() -> int:
     app.processEvents()
     check(scfg.setting(name).hotkey == "v", "单音效快捷键写入", str(scfg.setting(name).hotkey))
     check("v" in (scfg.hotkey_map() or {}), "进了 hotkey_map", str(scfg.hotkey_map()))
-    fns = [getattr(a, "__name__", "?") for _vk, a in poller._extra]
-    check(len(poller._extra) >= 3, "轮询器绑定数量增加", str(fns))
+    check("v" in poller._by_key, "音效快捷键进了绑定表", str(poller._by_key))
+    check(len(poller._actions) >= 2, "两个全局动作都还绑着", str(len(poller._actions)))
 
     det.btn_play.click()
     app.processEvents()

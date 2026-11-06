@@ -142,7 +142,7 @@ def main() -> int:
             time.sleep(step / 1000)
 
     state["n"] = 0
-    audio.play = lambda idx: state.__setitem__("n", state["n"] + 1) or True
+    audio.play = lambda idx, token=0: state.__setitem__("n", state["n"] + 1) or True
 
     fake.state["mouse_4"] = True
     run(60)
@@ -180,7 +180,9 @@ def main() -> int:
     st0.pitch_mode = PITCH_RANDOM
     st0.pitch_step = 2.0
     lengths: list[int] = []
-    audio2.mixer.trigger = lambda clip, gain=1.0: lengths.append(len(clip)) or True
+    # slot 是 v0.9.0 条件停止用的：这里只是量波形长度，多收一个关键字就行
+    audio2.mixer.trigger = (lambda clip, gain=1.0, token=0, **kw:
+                            lengths.append(len(clip)) or True)
     for _ in range(6):
         audio2.play(0)
     check(len(set(lengths)) >= 2, "随机变调真的改变了波形长度（=音高）",

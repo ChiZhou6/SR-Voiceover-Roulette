@@ -92,6 +92,7 @@ from sounds_config import (
     SPEED_MODE_LABEL,
     SPEED_MODES,
     SPEED_NONE,
+    STOP_KEYS_MAX,
     TRIG_COMBO,
     TRIG_LABEL,
     TRIG_PREV_END,
@@ -347,6 +348,25 @@ QPushButton#KeyClear:hover {{
     color: #ff8f8f;
 }}
 QPushButton#KeyClear:disabled {{
+    color: #3a414f;
+}}
+/* 「＋」：跟清除键同一套，但悬停是加号该有的"能点"的感觉 */
+QPushButton#KeyAdd {{
+    background: transparent;
+    border: 1px solid #2b303b;
+    color: #8b93a3;
+    padding: 0px;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 600;
+}}
+QPushButton#KeyAdd:hover {{
+    border-color: #3a2f16;
+    background: #2b2415;
+    color: #ffc76b;
+}}
+QPushButton#KeyAdd:disabled {{
+    border-color: #23262d;
     color: #3a414f;
 }}
 
@@ -3771,6 +3791,15 @@ class HelpPage(QWidget):
             "　 同一个解锁键按一下，名下所有音效一起放开，各自算各自的时间和次数；"
             "重复按是刷新，不叠加。"
         )
+        s3.para("停止（条件停止键，v0.9.0 新增）", "head")
+        s3.para(
+            "· 在「停止」那一行填一个键（点右边 ＋ 还能再加，最多 3 个）。"
+            "按一下：这个音效立刻停，同时重新上锁 —— 想再触发要重新按解锁键。\n"
+            "· 停的是「这个音效此刻正在响的所有声音」：快捷键按的、轮盘点的、"
+            "长按连发出来的都一起收；按下它之前已经响了几声也不留。\n"
+            "· 条件解锁时是「停 + 上锁」；无条件音效设了它就是「按一下就停」。\n"
+            "· 按住不放只停一次；好几个音效填同一个停止键，按一下一起停。"
+        )
         s3.para("一个现成玩法：长按播组合、松手播另一句", "head")
         s3.para(
             "1. 建组合「AAA」，挂鼠标左键，「触发」选长按触发；「条件」选条件解锁，"
@@ -3781,6 +3810,8 @@ class HelpPage(QWidget):
             "松手 AAA 停、同时播 B。\n"
             "4. 就算按完 G 过了 4.9 秒才按下左键，AAA 也照样能响 —— 解锁只决定"
             "「能不能开始」，不负责「掐断」。\n"
+            "5. 想随时反悔：给两个音效都填一个停止键（比如 3）。按 3 时正在响的"
+            "立刻哑掉、锁也重新扣上，想再响得重新按 G。\n"
             "注意：一个键挂好几个音效是允许的，上面这种就是两个音效共用一个键，"
             "各自的触发方式分别生效。"
         )
@@ -4307,12 +4338,15 @@ class SlotDetail(QFrame):
         self.setObjectName("Card")
         # 高度写死，免得内容增减时面板自己跳；改动行数后记得同步这个值
         # 188 → 246：v0.9 加了「触发」和「条件」两行
-        self.setFixedHeight(246)
+        # 246 → 270：v0.9.0 又加了「停止」一行（实测要 223，246 会把行距压没）
+        self.setFixedHeight(270)
 
         lay = QVBoxLayout(self)
         # v0.9：多了「触发 / 条件」两行，上下留白和行距都收一点，
         # 否则卡片要再长 10 多个像素，窗口就得多长一点
-        lay.setContentsMargins(16, 8, 16, 8)
+        # v0.9.0 又加了一行「停止」：上下留白再收到 6、行距 4→3，
+        # 省出 11px 正好把那一行塞进来，不用再把窗口往下拉
+        lay.setContentsMargins(16, 6, 16, 6)
         lay.setSpacing(4)
 
         head = QHBoxLayout()
@@ -4332,7 +4366,7 @@ class SlotDetail(QFrame):
         self.body = QWidget()
         body = QVBoxLayout(self.body)
         body.setContentsMargins(0, 0, 0, 0)
-        body.setSpacing(4)
+        body.setSpacing(3)
 
         vol_row = QHBoxLayout()
         vl = QLabel("音量")
@@ -4493,6 +4527,9 @@ class SlotDetail(QFrame):
 
         # ---- 触发条件（v0.9）：无条件 / 先用解锁键开门 ----
         cond_row = QHBoxLayout()
+        # 最小窗口下这一行要塞 5 个控件，默认间距会把最后两个数字框顶到一起；
+        # 收紧到 4px 刚好排得下（默认宽度下看不出来）
+        cond_row.setSpacing(4)
         self.lbl_unlock = cl = QLabel("条件")
         cl.setFixedWidth(52)
         cl.setStyleSheet("color:#a9b0c0;font-size:12px;")
@@ -4516,7 +4553,9 @@ class SlotDetail(QFrame):
         self.unlock_ms.setSingleStep(500)
         self.unlock_ms.setSuffix(" ms")
         self.unlock_ms.setSpecialValueText("不限时")
-        self.unlock_ms.setFixedWidth(96)
+        # 96 会把 "10000 ms" 的后缀裁成 "10000 r"（数字框还有两个箭头占宽），
+        # 从次数框借 6px 过来正好，整行总宽不变
+        self.unlock_ms.setFixedWidth(106)
         self.unlock_ms.setToolTip(
             "解锁后多久之内可以触发。0 = 不限时（一直到次数用完）。\n"
             "注意：时间到了只是「不能再触发新的」，正在响的声音会继续响完。"
@@ -4527,13 +4566,51 @@ class SlotDetail(QFrame):
         self.unlock_count.setSingleStep(1)
         self.unlock_count.setSuffix(" 次")
         self.unlock_count.setSpecialValueText("不限次")
-        self.unlock_count.setFixedWidth(90)
+        self.unlock_count.setFixedWidth(84)
         self.unlock_count.setToolTip(
             "解锁一次能用几次。0 = 不限次。\n"
             "长按连续触发整段按住也只算 1 次。"
         )
         cond_row.addWidget(self.unlock_count)
         body.addLayout(cond_row)
+
+        # ---- 条件停止（v0.9.0）：按一下立刻停掉，并重新上锁 ----
+        # 单独占一行："条件"那行已经排满（下拉 + 解锁键 + 时间 + 次数），
+        # 再往里塞一个按键框，最小窗口下会把下拉和数字框挤成一条缝。
+        stop_row = QHBoxLayout()
+        stop_row.setSpacing(4)
+        self.lbl_stop = sl = QLabel("停止")
+        sl.setFixedWidth(52)
+        sl.setStyleSheet("color:#a9b0c0;font-size:12px;")
+        stop_row.addWidget(sl)
+
+        # 停止键可以有好几个：都摆在同一个容器里，按哪个都算。
+        # 用容器而不是直接往行里塞，是为了加/删时不用动整行的布局。
+        self.stop_holder = QWidget()
+        self._stop_lay = QHBoxLayout(self.stop_holder)
+        self._stop_lay.setContentsMargins(0, 0, 0, 0)
+        self._stop_lay.setSpacing(4)
+        self._stop_boxes: list[KeyBox] = []
+        stop_row.addWidget(self.stop_holder)
+
+        self.btn_add_stop = QPushButton("＋")
+        self.btn_add_stop.setObjectName("KeyAdd")
+        self.btn_add_stop.setFixedSize(20, 20)
+        self.btn_add_stop.setCursor(Qt.PointingHandCursor)
+        self.btn_add_stop.setFocusPolicy(Qt.NoFocus)   # 别把焦点从按键框抢走
+        self.btn_add_stop.setToolTip(f"再加一个停止键（最多 {STOP_KEYS_MAX} 个）")
+        self.btn_add_stop.clicked.connect(self._on_add_stop)
+        stop_row.addWidget(self.btn_add_stop)
+
+        self.lbl_stop_hint = QLabel("按一下立刻停掉，并重新上锁")
+        self.lbl_stop_hint.setObjectName("Hint")
+        self.lbl_stop_hint.setToolTip(
+            "只对开了「条件解锁」的音效有「重新上锁」这层意思；\n"
+            "无条件音效设了它也是「按一下就停」，一样有用。"
+        )
+        stop_row.addWidget(self.lbl_stop_hint)
+        stop_row.addStretch(1)
+        body.addLayout(stop_row)
 
         lay.addWidget(self.body)
         lay.addStretch(1)
@@ -4581,6 +4658,7 @@ class SlotDetail(QFrame):
             self.unlock_key.set_key("")
             self.unlock_ms.setValue(0)
             self.unlock_count.setValue(0)
+            self._set_stop_keys([])
             self.chk_global.setChecked(False)
         else:
             self.title.setText(
@@ -4620,6 +4698,7 @@ class SlotDetail(QFrame):
             self.unlock_key.set_key(getattr(st, "unlock_key", "") or "")
             self.unlock_ms.setValue(int(getattr(st, "unlock_ms", 0)))
             self.unlock_count.setValue(int(getattr(st, "unlock_count", 0)))
+            self._set_stop_keys(list(getattr(st, "stop_keys", []) or []))
 
         for w in (self.volume, self.pitch_mode, self.pitch_step,
                   self.pitch_fixed,
@@ -4627,8 +4706,11 @@ class SlotDetail(QFrame):
                   self.pitch_window, self.hotkey, self.btn_play,
                   self.trigger_mode, self.repeat_ms,
                   self.unlock_mode, self.unlock_key,
-                  self.unlock_ms, self.unlock_count, self.chk_global):
+                  self.unlock_ms, self.unlock_count,
+                  self.chk_global):
             w.setEnabled(name is not None)
+        # 停止键框是动态建的，逐个置灰（加号按钮在 _sync_stop_ui 里管）
+        self.stop_holder.setEnabled(name is not None)
         self.btn_combo.setVisible(self._is_combo)
         self._sync_pitch_enabled()
         self._sync_trigger_ui()
@@ -4657,6 +4739,62 @@ class SlotDetail(QFrame):
             self.lbl_repeat_hint.setVisible(True)
         elif is_repeat:
             self.lbl_repeat_hint.setText("按住时每隔这么久再响一次")
+
+        # 停止键一直露着：无条件音效设了也照样有用（就是"按一下就停"），
+        # 只是说明得跟着变 —— 无条件没有"重新上锁"这回事，别乱许诺
+        self.lbl_stop_hint.setText(
+            "按一下立刻停掉，并重新上锁" if locked else "按一下立刻停掉这个音效"
+        )
+        self._sync_stop_ui()
+
+    # ---- 条件停止键（可以有好几个）----
+    def _set_stop_keys(self, keys) -> None:
+        """按配置把停止键框摆出来：有几个键就摆几个，最少留一个空框。
+
+        空框是给"还没设"的状态留的位置 —— 用户点进去直接按键就行，
+        不用先点加号。
+        """
+        vals = [str(k or "") for k in (keys or [])][:STOP_KEYS_MAX]
+        want = max(1, len(vals))
+        # 多了就拆，少了就补；按键框带自己的清除按钮，拆掉时要真的删掉
+        while len(self._stop_boxes) > want:
+            b = self._stop_boxes.pop()
+            self._stop_lay.removeWidget(b)
+            b.setParent(None)
+            b.deleteLater()
+        while len(self._stop_boxes) < want:
+            b = KeyBox("", 96)
+            b.setToolTip(
+                "条件停止键：按一下，这个音效立刻停（正在响的直接掐掉），\n"
+                "同时取消它的条件解锁 —— 想再触发得重新按解锁键。\n"
+                "不管声音是快捷键按出来的、轮盘点的，还是长按连发出来的，都会停。\n"
+                "可以设好几个，按哪个都算；空着 = 没有这个键。"
+            )
+            b.key_changed.connect(lambda _v: self._push())
+            self._stop_lay.addWidget(b)
+            self._stop_boxes.append(b)
+        for i, b in enumerate(self._stop_boxes):
+            b.set_key(vals[i] if i < len(vals) else "")
+
+    def _on_add_stop(self) -> None:
+        """加号：多摆一个空框。已经是最后一个了就不再动。"""
+        if len(self._stop_boxes) >= STOP_KEYS_MAX:
+            return
+        self._set_stop_keys([b.key_name for b in self._stop_boxes] + [""])
+        # 焦点直接放进新框，用户按一下键就绑上了
+        self._stop_boxes[-1].edit.setFocus()
+        self._sync_stop_ui()
+
+    def _sync_stop_ui(self) -> None:
+        """加号按钮和说明文字的显隐。
+
+        3 个按键框 + 说明文字在最小窗口下排不下，所以键多了就把说明让出来；
+        加满了（STOP_KEYS_MAX）就把加号藏掉，免得点了没反应。
+        """
+        n = len(self._stop_boxes)
+        self.btn_add_stop.setVisible(n < STOP_KEYS_MAX)
+        self.btn_add_stop.setEnabled(self.current is not None)
+        self.lbl_stop_hint.setVisible(n < 3)
 
     def _on_trigger_changed(self) -> None:
         self._sync_trigger_ui()
@@ -4751,6 +4889,7 @@ class SlotDetail(QFrame):
         st.unlock_key = self.unlock_key.key_name
         st.unlock_ms = int(self.unlock_ms.value())
         st.unlock_count = int(self.unlock_count.value())
+        st.stop_keys = [b.key_name for b in self._stop_boxes if b.key_name]
         if self._is_combo:
             # 组合没有"整体变调/速度"这回事，逐项参数归编辑器管
             st.hotkey = self.hotkey.key_name
@@ -4876,8 +5015,9 @@ class SettingsWindow(QWidget):
         self.setWindowTitle("SR Voiceover Roulette 设置")
         # 高度 780 → 840：v0.9 的音效卡片多了「触发」「条件」两行，
         # 不把窗口放高一点，右下角那块和轮盘预览会互相挤
-        self.resize(1120, 840)
-        self.setMinimumSize(980, 800)
+        # 840 → 880：v0.9.0 又多了「停止」一行（卡片 246 → 270）
+        self.resize(1120, 880)
+        self.setMinimumSize(980, 840)
         self.setStyleSheet(build_qss())
 
         outer = QVBoxLayout(self)
