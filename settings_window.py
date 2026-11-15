@@ -546,6 +546,39 @@ _QT_TO_KEY = {
     Qt.Key_Slash: "slash",
     Qt.Key_Semicolon: "semicolon",
     Qt.Key_Apostrophe: "quote",
+    # 主键区剩下的符号键
+    Qt.Key_Minus: "minus",
+    Qt.Key_Equal: "equal",
+    Qt.Key_BracketLeft: "lbracket",
+    Qt.Key_BracketRight: "rbracket",
+    Qt.Key_Backslash: "backslash",
+    Qt.Key_QuoteLeft: "backquote",
+    # 方向键 / 编辑区
+    Qt.Key_Up: "up",
+    Qt.Key_Down: "down",
+    Qt.Key_Left: "left",
+    Qt.Key_Right: "right",
+    Qt.Key_Insert: "insert",
+    Qt.Key_Home: "home",
+    Qt.Key_End: "end",
+    Qt.Key_PageUp: "pageup",
+    Qt.Key_PageDown: "pagedown",
+    Qt.Key_NumLock: "numlock",
+    # 其他
+    Qt.Key_Print: "printscreen",
+    Qt.Key_ScrollLock: "scrolllock",
+    Qt.Key_Pause: "pause",
+    Qt.Key_Menu: "menu",
+}
+
+# 小键盘上键位名和主键区重复（回车、0-9、* + - . /），靠 KeypadModifier 区分。
+# Qt 在这几种情况下会带这个修饰位，所以先判小键盘，落到这里就按小键盘算。
+_QT_KEYPAD_TO_KEY = {
+    Qt.Key_Asterisk: "num_mul",
+    Qt.Key_Plus: "num_add",
+    Qt.Key_Minus: "num_sub",
+    Qt.Key_Period: "num_dot",
+    Qt.Key_Slash: "num_div",
 }
 
 
@@ -581,15 +614,49 @@ _KEY_LABEL = {
     "mouse_5": "侧键2",
     "wheel_up": "滚轮上",
     "wheel_down": "滚轮下",
+    "wheel_left": "横滚←",
+    "wheel_right": "横滚→",
     "space": "空格",
     "enter": "回车",
     "esc": "Esc",
+    "tab": "Tab",
+    "comma": ",",
+    "period": ".",
+    "slash": "/",
+    "semicolon": ";",
+    "quote": "'",
     "capslock": "Caps",
     "ctrl": "Ctrl",
     "shift": "Shift",
     "alt": "Alt",
     "win": "Win",
+    "up": "↑",
+    "down": "↓",
+    "left": "←",
+    "right": "→",
+    "insert": "Insert",
+    "home": "Home",
+    "end": "End",
+    "pageup": "PgUp",
+    "pagedown": "PgDn",
+    "numlock": "NumLock",
+    "num_mul": "小键盘*",
+    "num_add": "小键盘+",
+    "num_sub": "小键盘-",
+    "num_dot": "小键盘.",
+    "num_div": "小键盘/",
+    "minus": "-",
+    "equal": "=",
+    "lbracket": "[",
+    "rbracket": "]",
+    "backslash": "\\",
+    "backquote": "`",
+    "printscreen": "PrtSc",
+    "scrolllock": "ScrLk",
+    "pause": "Pause",
+    "menu": "Menu",
 }
+_KEY_LABEL.update({f"num{i}": f"小键盘{i}" for i in range(10)})
 
 
 def key_label(name: str) -> str:
@@ -621,6 +688,16 @@ def _mods_prefix(mods) -> str:
 def key_name_of(ev) -> str:
     """Qt 按键事件 -> config 里的按键名（vk_of 能认的那种）。"""
     k = ev.key()
+    # 小键盘先判：它的数字和运算符跟主键区共用 Qt 键值，只能靠这个标志位分家。
+    # 小键盘回车（Key_Enter）不在此列 —— 它和主键区回车本来就同一个虚拟键码。
+    if ev.modifiers() & Qt.KeypadModifier:
+        if k in _QT_KEYPAD_TO_KEY:
+            return _QT_KEYPAD_TO_KEY[k]
+        if Qt.Key_0 <= k <= Qt.Key_9:
+            return f"num{k - Qt.Key_0}"
+        if k in (Qt.Key_Enter, Qt.Key_Return):
+            return "enter"
+        return ""
     if k in _QT_TO_KEY:
         return _QT_TO_KEY[k]
     if Qt.Key_A <= k <= Qt.Key_Z:
@@ -711,10 +788,16 @@ class _KeyEdit(QLineEdit):
         if not self.hasFocus():
             super().wheelEvent(ev)
             return
-        delta = ev.angleDelta().y()
-        if delta == 0:
+        dy = ev.angleDelta().y()
+        dx = ev.angleDelta().x()
+        # 普通滚轮是 y，横向滚轮（往左右拨）是 x
+        if dy == 0 and dx == 0:
             return
-        self._apply("wheel_up" if delta > 0 else "wheel_down")
+        if dy:
+            name = "wheel_up" if dy > 0 else "wheel_down"
+        else:
+            name = "wheel_right" if dx > 0 else "wheel_left"
+        self._apply(name)
         ev.accept()
 
     def mousePressEvent(self, ev) -> None:  # noqa: N802
@@ -2624,8 +2707,9 @@ class HotkeyPage(QWidget):
         l1.addWidget(_row("轻按热键", self.tap, "短按不弹轮盘时执行"))
         tip = QLabel(
             "所有按键框都能绑鼠标：点进框里按右键 / 中键 / 侧键即可；"
-            "要绑鼠标左键请双击框；点框右侧的 ✕ 取消绑定。\n"
+            "要绑鼠标左键请双击框；滚轮上下、横向滚轮也能绑；点框右侧的 ✕ 取消绑定。\n"
             "想绑组合键：按住 Ctrl / Shift / Alt 再按主键，框里会显示成「Ctrl+Shift+Y」。\n"
+            "方向键、小键盘（显示成「小键盘5」）、Home/End/PgUp/PgDn、PrtSc 这些也都能绑。\n"
             "呼出轮盘的框不能空着：清掉会自动退回上一个可用键。"
         )
         tip.setObjectName("Hint")
@@ -2690,20 +2774,6 @@ class HotkeyPage(QWidget):
         self.lbl_conflict.hide()
         root.addWidget(self.lbl_conflict)
 
-        card3, l3 = _card("音效直按键")
-        hint = QLabel(
-            "每个音效可以单独绑一个键，按下直接播放，不用开轮盘。\n"
-            "支持 Xbox 手柄（蓝牙/有线）：点音效的快捷键框，再按手柄按钮。\n"
-            "也支持滚轮上下、单独绑一个 Alt / Shift / Ctrl（只按一下就绑上）。\n"
-            "在右下角那张音效卡片的「快捷键」里设置，下面两行「触发 / 条件」\n"
-            "决定它是按下就响、按住才响、松手才响，还是要先按解锁键。\n"
-            "同一个键可以挂好几个音效（比如长按左键播组合、松手左键播另一句），\n"
-            "各自的触发方式分别生效。"
-        )
-        hint.setObjectName("Hint")
-        hint.setWordWrap(True)
-        l3.addWidget(hint)
-        root.addWidget(card3)
         root.addStretch(1)
 
         self.key_wheel.key_changed.connect(lambda _v: self._push())
@@ -3888,6 +3958,19 @@ class HelpPage(QWidget):
             "· 勾上：先把上一声掐掉，再从头放。长句子、整段台词建议勾 —— "
             "不然连按会听见几层不同进度糊在一起。\n"
             "· 只影响这一个格子；快捷键、轮盘点选、长按连发都按它执行。"
+        )
+        s3.para("按键（能绑的又多了）", "head")
+        s3.para(
+            "· 键盘现在几乎全能绑：字母、主键区数字、F1~F24、空格/Tab/回车/Esc/Caps、"
+            "逗号句号斜杠分号引号、减号等号方括号反斜杠反引号、方向键 ↑↓←→、"
+            "Insert/Home/End/PageUp/PageDown、小键盘 0~9 与 * + - . /、NumLock、"
+            "PrtSc/ScrLk/Pause、菜单键（App）。\n"
+            "· 小键盘单独算一套：绑「小键盘5」，按主键区的 5 不会响，反之亦然。"
+            "绑小键盘数字时 NumLock 要开着 —— 关着的时候小键盘发的是方向键那一套。\n"
+            "· 鼠标多了横向滚轮：滚轮往左右拨，框里显示「横滚←」「横滚→」。\n"
+            "· 仍然绑不了：Delete / Backspace（在这两个框里它们是「清空绑定」的意思）、"
+            "单独 Win 键（跟开始菜单抢）、多媒体键（音量、播放那些）、Fn、输入法转换键 —— "
+            "这几个系统层就不当普通按键发出来，程序收不到，不是漏做。"
         )
         s3.para("手柄（v0.9.1 新增）", "head")
         s3.para(

@@ -59,7 +59,8 @@ def fake_mouse(flags=0, data=0):
 
 
 raw = sr.RawMouse()
-check(sr.WHEEL_KEYS == ("wheel_up", "wheel_down"), "滚轮键名固定为 wheel_up / wheel_down")
+check(sr.WHEEL_KEYS == ("wheel_up", "wheel_down", "wheel_left", "wheel_right"),
+      "滚轮键名固定为 wheel_up / wheel_down / wheel_left / wheel_right")
 
 # 往上滚：usButtonData 是正数（按 SHORT 解释）
 raw._on_raw(fake_mouse(0x0400, 120))

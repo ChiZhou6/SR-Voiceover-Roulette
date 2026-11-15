@@ -193,7 +193,8 @@ MOUSE_KEYS = tuple(RI_MOUSE_BUTTON_DOWN)
 # （Qt 是单线程：原生事件和定时器 tick 都跑在同一个事件循环里，
 #  tick 执行期间不会有新的滚轮事件插进来，所以帧末清是安全的）。
 RI_MOUSE_WHEEL = 0x0400
-WHEEL_KEYS = ("wheel_up", "wheel_down")
+RI_MOUSE_HWHEEL = 0x0800
+WHEEL_KEYS = ("wheel_up", "wheel_down", "wheel_left", "wheel_right")
 
 # 轮盘弹出来之后，按这两个键 = 立刻取消这次呼出（松手也不会播任何东西）。
 # 游戏里的习惯动作：想反悔就点一下左键或右键。
@@ -282,12 +283,27 @@ def vk_of(name: str) -> int:
         "win": 0x5B, "lwin": 0x5B, "rwin": 0x5C,
         "comma": 0xBC, "period": 0xBE, "slash": 0xBF,
         "semicolon": 0xBA, "quote": 0xDE,
+        # 主键区剩下的符号键（v0.9.2 补）
+        "minus": 0xBD, "equal": 0xBB,
+        "lbracket": 0xDB, "rbracket": 0xDD,
+        "backslash": 0xDC, "backquote": 0xC0,
+        # 方向键与编辑区
+        "up": 0x26, "down": 0x28, "left": 0x25, "right": 0x27,
+        "insert": 0x2D, "home": 0x24, "end": 0x23,
+        "pageup": 0x21, "pagedown": 0x22,
+        # 小键盘：换行键（VK_SEPARATOR）和加号在部分键盘上各走各的，这里按标准 VK 走
+        "numlock": 0x90,
+        "num_mul": 0x6A, "num_add": 0x6B, "num_sub": 0x6D,
+        "num_dot": 0x6E, "num_div": 0x6F,
+        # 其他
+        "printscreen": 0x2C, "scrolllock": 0x91, "pause": 0x13, "menu": 0x5D,
         "lshift": 0xA0, "rshift": 0xA1, "lctrl": 0xA2, "rctrl": 0xA3,
         "lalt": 0xA4, "ralt": 0xA5,
         "mouse_left": 0x01, "mouse_right": 0x02, "mouse_mid": 0x04,
         # 侧键：GetAsyncKeyState 对这两个不可靠，正常走 Raw Input，这里只作兜底
         "mouse_middle": 0x04, "mouse_4": 0x05, "mouse_5": 0x06,
     }
+    table.update({f"num{i}": 0x60 + i for i in range(10)})  # VK_NUMPAD0..9
     return table.get(name, 0x59)
 
 
@@ -308,7 +324,20 @@ _SPEC_LABEL.update(BUTTON_LABELS)
 _SPEC_LABEL.update({"mouse_left": "鼠标左键", "mouse_right": "鼠标右键",
                     "mouse_middle": "鼠标中键", "mouse_4": "侧键1",
                     "mouse_5": "侧键2", "wheel_up": "滚轮上",
-                    "wheel_down": "滚轮下"})
+                    "wheel_down": "滚轮下", "wheel_left": "横滚←",
+                    "wheel_right": "横滚→",
+                    "up": "↑", "down": "↓", "left": "←", "right": "→",
+                    "insert": "Insert", "home": "Home", "end": "End",
+                    "pageup": "PageUp", "pagedown": "PageDown",
+                    "numlock": "NumLock",
+                    "num_mul": "小键盘*", "num_add": "小键盘+",
+                    "num_sub": "小键盘-", "num_dot": "小键盘.",
+                    "num_div": "小键盘/",
+                    "minus": "-", "equal": "=", "lbracket": "[",
+                    "rbracket": "]", "backslash": "\\", "backquote": "`",
+                    "printscreen": "PrtSc", "scrolllock": "ScrLk",
+                    "pause": "Pause", "menu": "Menu"})
+_SPEC_LABEL.update({f"num{i}": f"小键盘{i}" for i in range(10)})
 
 
 def spec_parts(spec: str) -> list[str]:
@@ -702,6 +731,13 @@ class RawMouse(QObject):
                     self._wheel_hits["wheel_up"] += 1
                 elif delta < 0:
                     self._wheel_hits["wheel_down"] += 1
+            # 横向滚轮（0x0800）：往右拨是正、往左是负，同一套计数
+            if flags & RI_MOUSE_HWHEEL:
+                delta = ctypes.c_short(mouse.usButtonData).value
+                if delta > 0:
+                    self._wheel_hits["wheel_right"] += 1
+                elif delta < 0:
+                    self._wheel_hits["wheel_left"] += 1
 
         if mouse.usFlags & MOUSE_MOVE_ABSOLUTE:
             # 远程桌面 / 数位板之类走绝对坐标，这里不做换算，直接跳过
