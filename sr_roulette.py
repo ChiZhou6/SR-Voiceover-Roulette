@@ -83,6 +83,7 @@ from ctypes import wintypes
 from pathlib import Path
 
 import numpy as np
+from gamepad_input import BUTTON_LABELS, GamepadInput
 from PySide6.QtCore import (
     QAbstractNativeEventFilter,
     QEasingCurve,
@@ -152,7 +153,7 @@ import theme
 from theme import accent, accent_dark, accent_light, set_accent
 
 APP_NAME = "SR Voiceover Roulette"
-APP_VERSION = "v0.9.0"
+APP_VERSION = "v0.9.1"
 
 DEBUG = os.environ.get("SR_DEBUG") == "1"
 
@@ -186,6 +187,13 @@ RI_MOUSE_BUTTON_DOWN = {
     "mouse_5": 0x0100,   # 侧键 2
 }
 MOUSE_KEYS = tuple(RI_MOUSE_BUTTON_DOWN)
+
+# 滚轮：Raw Input 里它是"事件"而不是"按住状态"，所以不能混进 MOUSE_KEYS。
+# 收到一个刻度就在 _wheel_hits 上记一笔，这一帧里算"按下"，帧末清零
+# （Qt 是单线程：原生事件和定时器 tick 都跑在同一个事件循环里，
+#  tick 执行期间不会有新的滚轮事件插进来，所以帧末清是安全的）。
+RI_MOUSE_WHEEL = 0x0400
+WHEEL_KEYS = ("wheel_up", "wheel_down")
 
 # 轮盘弹出来之后，按这两个键 = 立刻取消这次呼出（松手也不会播任何东西）。
 # 游戏里的习惯动作：想反悔就点一下左键或右键。
@@ -296,6 +304,11 @@ _SPEC_MODS = {
 _MOD_ORDER = {"ctrl": 0, "alt": 1, "shift": 2, "win": 3}
 
 _SPEC_LABEL = {"ctrl": "Ctrl", "alt": "Alt", "shift": "Shift", "win": "Win"}
+_SPEC_LABEL.update(BUTTON_LABELS)
+_SPEC_LABEL.update({"mouse_left": "鼠标左键", "mouse_right": "鼠标右键",
+                    "mouse_middle": "鼠标中键", "mouse_4": "侧键1",
+                    "mouse_5": "侧键2", "wheel_up": "滚轮上",
+                    "wheel_down": "滚轮下"})
 
 
 def spec_parts(spec: str) -> list[str]:
@@ -639,6 +652,8 @@ class RawMouse(QObject):
         # 鼠标按键状态。键盘走 GetAsyncKeyState，鼠标侧键那个 API 不可靠，
         # 所以统一从 Raw Input 的 usButtonFlags 拿。
         self._btn_state: dict[str, bool] = {k: False for k in MOUSE_KEYS}
+        # 滚轮这一帧里滚了几个刻度、往哪边（见 WHEEL_KEYS）
+        self._wheel_hits: dict[str, int] = {k: 0 for k in WHEEL_KEYS}
 
         # 1x1 的离屏窗口，只为给 Raw Input 提供一个投递目标，用户完全看不到
         self._host = QWidget(
@@ -679,6 +694,14 @@ class RawMouse(QObject):
                     if DEBUG and self._btn_state[name]:
                         _log(f"[raw] {name} 松开")
                     self._btn_state[name] = False
+            # 滚轮：0x0400 = RI_MOUSE_WHEEL，滚了几格在 usButtonData 里，
+            # 是有符号的（往上滚是正、往下滚是负），所以按 SHORT 解释。
+            if flags & RI_MOUSE_WHEEL:
+                delta = ctypes.c_short(mouse.usButtonData).value
+                if delta > 0:
+                    self._wheel_hits["wheel_up"] += 1
+                elif delta < 0:
+                    self._wheel_hits["wheel_down"] += 1
 
         if mouse.usFlags & MOUSE_MOVE_ABSOLUTE:
             # 远程桌面 / 数位板之类走绝对坐标，这里不做换算，直接跳过
@@ -690,6 +713,15 @@ class RawMouse(QObject):
 
     def button_down(self, name: str) -> bool:
         return bool(self._btn_state.get(name, False))
+
+    def wheel_hit(self, name: str) -> bool:
+        """这一帧里滚轮有没有往这个方向滚过（滚轮没有"按住"这回事）。"""
+        return self._wheel_hits.get(name, 0) > 0
+
+    def clear_wheel(self) -> None:
+        """一帧处理完清账，下一帧重新计数。"""
+        for k in self._wheel_hits:
+            self._wheel_hits[k] = 0
 
     def take(self) -> tuple[float, float]:
         """取走并清零自上次调用以来的累计位移。"""
@@ -2766,6 +2798,12 @@ class AudioEngine(QObject):
         if not (0 <= idx < len(self.clips)):
             return False
 
+        st = self._setting_of_slot(idx)
+        # 连击时停掉上一个：先把这一格上一声还没放完的掐掉，再开口。
+        # 默认不掐（叠加），勾了才走这里。
+        if st is not None and getattr(st, "stop_prev", False):
+            self.stop_slot(idx)
+
         # 组合条目：不走普通音效那套连击变调，直接进组合排程
         entry = self.bank.entry_at(idx)
         if isinstance(entry, ComboEntry):
@@ -2777,7 +2815,6 @@ class AudioEngine(QObject):
         clip = self.clips[idx]
         if clip is None:
             return False
-        st = self._setting_of_slot(idx)
         gain = 1.0
         semitones = 0.0
         speed = 0.0
@@ -3243,6 +3280,17 @@ class AudioEngine(QObject):
         for mix in self._mixers_all():
             mix.stop_token(token)
 
+    def stop_slot(self, idx: int, fade_ms: float = 12.0) -> int:
+        """掐掉某个槽位放出来的全部声部。两个出口都掐。
+
+        「连击时停掉上一个」和条件停止键都走这里：声音是按槽位认的，
+        不管它是快捷键按的、轮盘点响的，还是长按连发出来的。
+        """
+        n = 0
+        for mix in self._mixers_all():
+            n += mix.stop_slot(idx, fade_ms)
+        return n
+
     def stop_named(self, name: str, fade_ms: float = 12.0) -> int:
         """掐掉某个音效**此刻**正在响的全部声音（条件停止键用）。
 
@@ -3259,10 +3307,7 @@ class AudioEngine(QObject):
             idx = self._global_slots.get(name, -1)
         if idx < 0:
             return 0
-        n = 0
-        for mix in self._mixers_all():
-            n += mix.stop_slot(idx, fade_ms)
-        return n
+        return self.stop_slot(idx, fade_ms)
 
     @property
     def playing(self) -> bool:
@@ -4666,11 +4711,17 @@ def settings_blocks_hotkey(win) -> bool:
     if win is None:
         return False
     try:
-        return (
-            bool(win.isVisible())
-            and not win.isMinimized()
-            and bool(win.isActiveWindow())
-        )
+        if not win.isVisible() or win.isMinimized():
+            return False
+        if win.isActiveWindow():
+            return True
+        # 组合编辑器是独立的子窗口，录入绑定时同样要暂停播放。
+        active = QApplication.activeWindow()
+        while active is not None:
+            if active is win:
+                return True
+            active = active.parentWidget()
+        return False
     except RuntimeError:          # 窗口对象已经被销毁
         return False
 
@@ -4679,12 +4730,15 @@ class InputPoller(QObject):
     """GetAsyncKeyState 轮询。全程无钩子，不阻断游戏输入。"""
 
     def __init__(self, cfg: dict, wheel: WheelController, audio: AudioEngine,
-                 switcher: "WheelSwitchController | None" = None) -> None:
+                 switcher: "WheelSwitchController | None" = None,
+                 gamepad=None) -> None:
         super().__init__()
         self.cfg = cfg
         self.wheel = wheel
         self.audio = audio
         self.switcher = switcher
+        self.gamepad = gamepad if gamepad is not None else GamepadInput()
+        self._pad_suppressed: set[str] = set()
         # 切换轮盘的那个键：单独一套按下/松手状态，和主热键互不干扰
         self._sw_prev = False
         self._sw_at = 0.0
@@ -4816,12 +4870,43 @@ class InputPoller(QObject):
         raw = getattr(self.wheel, "raw", None)
         raw_ok = raw is not None and getattr(raw, "registered", False)
         for p in parts:
-            if p in MOUSE_KEYS and raw_ok:
+            if p.startswith("pad_"):
+                if p in self._pad_suppressed or not self.gamepad.down(p):
+                    return False
+            elif p in WHEEL_KEYS:
+                if not (raw_ok and raw.wheel_hit(p)):
+                    return False
+            elif p in MOUSE_KEYS and raw_ok:
                 if not raw.button_down(p):
                     return False
             elif not is_down(vk_of(p)):
                 return False
         return True
+
+    def _cancel_gamepad(self) -> None:
+        """断线/录入属于取消，不能当作一次正常松手去播放音效。"""
+        def uses_pad(key):
+            return any(p.startswith("pad_") for p in spec_parts(key))
+
+        for key, names in self._by_key.items():
+            if uses_pad(key):
+                self._key_prev[key] = False
+                for name in names:
+                    self._stop_hold(name)
+                    self._repeat_next.pop(name, None)
+        for previous in (self._action_prev, self._unlock_prev, self._stop_prev):
+            for key in previous:
+                if uses_pad(key):
+                    previous[key] = False
+        if uses_pad(self.hotkey_name):
+            self._prev = False
+            self._held_to_wheel = True
+            if self.wheel.active:
+                self.wheel.hide_wheel()
+        if uses_pad(self.cfg.get("switch_key", "")):
+            self._sw_prev = False
+            if self.switcher is not None and self.switcher.active:
+                self.switcher.hide_wheel()
 
     def rebuild_bindings(self) -> None:
         """重建快捷键绑定。改了快捷键或增删音效后调用一次。
@@ -4892,6 +4977,9 @@ class InputPoller(QObject):
                 _log(f"[bind] 读条件停止键失败: {exc}")
 
         self._actions = actions
+        # 保存刚录入的按钮时，等手柄松开再接收下一次按键。
+        self.gamepad.update()
+        self._pad_suppressed.update(self.gamepad.buttons)
         # 记下当前状态，避免刚绑定就立刻误触发
         self._action_prev = {k: self._down(k) for k, _a in actions}
         self._by_key = by_key
@@ -5145,6 +5233,30 @@ class InputPoller(QObject):
         self._timer.start()
 
     def tick(self) -> None:
+        """一帧。滚轮的"按下"只在这一帧内有效，所以不管从哪条路返回都要清账。"""
+        try:
+            self._tick_once()
+        finally:
+            raw = getattr(self.wheel, "raw", None)
+            clear = getattr(raw, "clear_wheel", None)
+            if clear is not None:      # 测试里的假 raw 可能没实现，忽略即可
+                clear()
+
+    def _tick_once(self) -> None:
+        self.gamepad.update()
+        self._pad_suppressed.intersection_update(self.gamepad.buttons)
+        settings_paused = self.paused is not None and self.paused()
+        if self.gamepad.cancelled or settings_paused:
+            self._cancel_gamepad()
+        if settings_paused:
+            self._pad_suppressed.update(self.gamepad.buttons)
+        if self.user_paused:
+            # 暂停期间按下的音效键，恢复后松手也不应发声。
+            for key in self._by_key:
+                self._pad_suppressed.update(
+                    p for p in spec_parts(key) if p in self.gamepad.buttons
+                )
+            self._cancel_gamepad()
         # 这一帧开始时轮盘是不是开着。鼠标键在轮盘开着时按下去 = "取消呼出"，
         # 取消的同时轮盘已经关了，所以必须现在记下来，否则后面的音效绑定
         # 会以为"轮盘没开"，顺手把音效放出来。
@@ -5158,7 +5270,7 @@ class InputPoller(QObject):
                 mouse_pressed = True
             self._mouse_prev[name] = d
 
-        if self.paused is not None and self.paused():
+        if settings_paused:
             # 暂停期间同步状态，恢复时不会把"暂停前按住"当成新按下
             self._prev = self._down(self.hotkey_name)
             self._press_at = time.monotonic()
@@ -5512,4 +5624,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--check-startup":
+        # 对最终 exe 做启动检查，使用报告旁的测试数据，不进入自启/托盘逻辑。
+        sys.modules["sr_roulette"] = sys.modules[__name__]
+        from startup_check import run
+        raise SystemExit(run(Path(sys.argv[2])))
     raise SystemExit(main())

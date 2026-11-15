@@ -178,6 +178,9 @@ check(unl.get("g") == ["AAA.wav", "B.wav"], "G 一次解锁两个音效", str(un
 audio = FakeAudio(scfg)
 poller = sr.InputPoller(cfg, wheel, audio, None)
 poller._down = lambda name: bool(state.get(name, False))
+# 重新播种一次按下状态：构造时用的是真实 _down，万一测试跑的时候
+# 鼠标正好被按着，会把"按下"记成已经按住，后面的合成按键就不算新按下了
+poller.rebuild_bindings()
 
 
 def press(key, on=True, p=None):
@@ -290,6 +293,9 @@ c.unlock_count = 2          # 两次机会：整段按住只该扣 1 次
 audio2 = FakeAudio(scfg2)
 p2 = sr.InputPoller(cfg, FakeWheel(), audio2, None)
 p2._down = lambda name: bool(state.get(name, False))
+# 重新播种一次按下状态：构造时用的是真实 _down，万一测试跑的时候
+# 鼠标正好被按着，会把"按下"记成已经按住，后面的合成按键就不算新按下了
+p2.rebuild_bindings()
 state.clear()
 
 press("g", True, p2)
@@ -341,6 +347,9 @@ w3 = FakeWheel()
 p3 = sr.InputPoller(cfg, w3, audio3, None)
 state.clear()
 p3._down = lambda name: bool(state.get(name, False))
+# 重新播种一次按下状态：构造时用的是真实 _down，万一测试跑的时候
+# 鼠标正好被按着，会把"按下"记成已经按住，后面的合成按键就不算新按下了
+p3.rebuild_bindings()
 
 state["mouse_left"] = True
 p3.tick()
@@ -378,6 +387,9 @@ audio4 = FakeAudio(scfg4)
 p4 = sr.InputPoller(cfg, FakeWheel(), audio4, None)
 state.clear()
 p4._down = lambda name: bool(state.get(name, False))
+# 重新播种一次按下状态：构造时用的是真实 _down，万一测试跑的时候
+# 鼠标正好被按着，会把"按下"记成已经按住，后面的合成按键就不算新按下了
+p4.rebuild_bindings()
 
 state["f2"] = True
 p4.tick()

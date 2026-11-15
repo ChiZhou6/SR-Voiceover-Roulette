@@ -85,6 +85,11 @@ DROP = [
 
 def _keep(name: str) -> bool:
     low = name.lower().replace("/", "\\")
+    # Qt 使用 Windows 自带 ICU 的无后缀函数。构建机 PATH 中的 Poppler
+    # 也有 icuuc.dll，但只导出 ucnv_open_78 等版本化函数，打进包会使
+    # QtCore 启动时报 WinError 127。Windows 10/11 上让系统提供这份 DLL。
+    if low.rsplit("\\", 1)[-1] == "icuuc.dll":
+        return False
     return not any(s in low for s in DROP)
 
 

@@ -178,6 +178,9 @@ class SoundSetting:
     # 只在"条件解锁"时才有"重新上锁"这层意思，但"按一下就停"对无条件
     # 音效同样有用，所以不看 unlock_mode，只要设了就生效。
     stop_keys: list[str] = field(default_factory=list)
+    # 连击时停掉上一个：再按一次的时候，先把这一格上一声还没放完的掐掉，
+    # 而不是叠在一起响。默认关着（和以前一样是叠加）。
+    stop_prev: bool = False
 
     def clamped(self) -> "SoundSetting":
         """把越界的值收回来。手改 json 写错了也不至于出怪声。"""
@@ -205,6 +208,7 @@ class SoundSetting:
         s.unlock_ms = max(0, min(UNLOCK_MS_MAX, int(s.unlock_ms)))
         s.unlock_count = max(0, min(UNLOCK_COUNT_MAX, int(s.unlock_count)))
         s.stop_keys = _norm_keys(s.stop_keys)
+        s.stop_prev = bool(s.stop_prev)
         return s
 
 
@@ -324,7 +328,10 @@ COMBO_MODE_TIP = {
             "越点越乱，建议配合冷却使用。",
 }
 
-MAX_COMBO_ITEMS = 24
+# 一条组合最多能放多少项。原来是 24，做长串连音/整段台词根本不够用，
+# 现在放到 100：每项只是一条排程记录，触发时一次算完，不会因为条数卡顿；
+# 真正的墙是"同时响几条"，那个由 max_voices 管，跟这个不是一回事。
+MAX_COMBO_ITEMS = 100
 
 
 # 延迟可以为负：负数 = 比参照点更早开始，用来做"尾巴叠上一项"的交叠衔接。

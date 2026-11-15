@@ -557,6 +557,21 @@ _QT_BUTTON_TO_KEY = {
     Qt.ForwardButton: "mouse_5",   # 侧键 2
 }
 
+# 能单独绑定的修饰键。故意不含 Win：单绑 Win 会跟开始菜单抢焦点，
+# 而且 GetAsyncKeyState 查 0x5B 常常读到系统刚吞下的那一下。
+_MODIFIER_KEYS = {
+    Qt.Key_Shift: "shift",
+    Qt.Key_Control: "ctrl",
+    Qt.Key_Alt: "alt",
+}
+# 松开某个修饰键时，Qt 报的 modifiers() 里仍然带着这个键自己
+# （Shift 松手那一刻还是 ShiftModifier），所以要把它自己刨掉再看还有没有别的。
+_MODIFIER_FLAGS = {
+    Qt.Key_Shift: Qt.ShiftModifier,
+    Qt.Key_Control: Qt.ControlModifier,
+    Qt.Key_Alt: Qt.AltModifier,
+}
+
 # 显示用短名。鼠标键不能直接显示 "MOUSE_4"，框里放不下也看不懂
 _KEY_LABEL = {
     "mouse_left": "鼠标左键",
@@ -564,6 +579,8 @@ _KEY_LABEL = {
     "mouse_middle": "鼠标中键",
     "mouse_4": "侧键1",
     "mouse_5": "侧键2",
+    "wheel_up": "滚轮上",
+    "wheel_down": "滚轮下",
     "space": "空格",
     "enter": "回车",
     "esc": "Esc",
@@ -584,7 +601,7 @@ def key_label(name: str) -> str:
     parts = sr.spec_parts(name)
     if not parts:
         return ""
-    return "+".join(_KEY_LABEL.get(p, p.upper()) for p in parts)
+    return "+".join(sr.BUTTON_LABELS.get(p, _KEY_LABEL.get(p, p.upper())) for p in parts)
 
 
 def _mods_prefix(mods) -> str:
@@ -624,9 +641,18 @@ class _KeyEdit(QLineEdit):
 
     key_changed = Signal(str)
 
-    def __init__(self, value: str = "", width: int = 96) -> None:
+    def __init__(self, value: str = "", width: int = 96,
+                 allow_gamepad: bool = False) -> None:
         super().__init__()
         self.key_name = ""
+        self._allow_gamepad = allow_gamepad
+        # 单独按修饰键时先记着，松手那一刻如果没配主键，就当它自己是个键
+        self._pending_mod = ""
+        self._gamepad = None
+        self._pad_prev: set[str] = set()
+        self._pad_timer = QTimer(self)
+        self._pad_timer.setInterval(30)
+        self._pad_timer.timeout.connect(self._poll_gamepad)
         self.setFixedWidth(width)
         self.setAlignment(Qt.AlignCenter)
         self.setPlaceholderText("未绑定")
@@ -643,24 +669,53 @@ class _KeyEdit(QLineEdit):
         self.setToolTip(self._tip())
 
     def _tip(self) -> str:
-        return (
-            "点一下，然后按键盘键或鼠标键；右侧 ✕ 或 Delete 取消绑定\n"
+        tip = (
+            "点一下，然后按键盘键、鼠标键或滚轮；右侧 ✕ 或 Delete 取消绑定\n"
             "要绑组合键就这样：按住 Ctrl / Shift / Alt，再按主键\n"
+            "只按一下 Ctrl / Shift / Alt 也能单独绑上（松手那一刻生效）\n"
             "（要绑鼠标左键请双击这个框，单击左键只是选中框）"
         )
+        if self._allow_gamepad:
+            tip += "\nXbox 手柄：点进框后按按钮（蓝牙/有线均可）；LT/RT 按过一半录入。"
+        return tip
 
     # ---- 录入 ----
     def keyPressEvent(self, ev) -> None:  # noqa: N802
         if ev.key() in (Qt.Key_Delete, Qt.Key_Backspace):
             self._apply("")
             return
-        if ev.key() in (Qt.Key_Shift, Qt.Key_Control, Qt.Key_Alt, Qt.Key_Meta):
-            # 单按修饰键不当作绑定目标，避免误绑
+        if ev.key() in _MODIFIER_KEYS:
+            # 修饰键按下先不绑：它可能只是组合键的前半截。
+            # 记下来，等松手时再看看有没有配主键（见 keyReleaseEvent）。
+            self._pending_mod = _MODIFIER_KEYS[ev.key()]
             return
         name = key_name_of(ev)
         if name:
+            self._pending_mod = ""      # 配了主键，说明是组合，修饰键不再单独算
             prefix = _mods_prefix(ev.modifiers())
             self._apply(f"{prefix}+{name}" if prefix else name)
+
+    def keyReleaseEvent(self, ev) -> None:  # noqa: N802
+        if ev.key() in _MODIFIER_KEYS:
+            pending = self._pending_mod
+            self._pending_mod = ""
+            # 还按着别的修饰键 → 这是 Ctrl+Shift 之类的半个组合，不绑
+            others = ev.modifiers().value & ~_MODIFIER_FLAGS[ev.key()].value
+            if pending == _MODIFIER_KEYS[ev.key()] and others == 0:
+                self._apply(pending)
+            return
+        super().keyReleaseEvent(ev)
+
+    def wheelEvent(self, ev) -> None:  # noqa: N802
+        # 只在框有焦点时录入，否则在列表里滚一下就把绑定改掉了
+        if not self.hasFocus():
+            super().wheelEvent(ev)
+            return
+        delta = ev.angleDelta().y()
+        if delta == 0:
+            return
+        self._apply("wheel_up" if delta > 0 else "wheel_down")
+        ev.accept()
 
     def mousePressEvent(self, ev) -> None:  # noqa: N802
         prefix = _mods_prefix(ev.modifiers())
@@ -694,6 +749,28 @@ class _KeyEdit(QLineEdit):
     def focusInEvent(self, ev) -> None:  # noqa: N802
         super().focusInEvent(ev)
         self.selectAll()
+        if self._allow_gamepad:
+            self._gamepad = sr.GamepadInput()
+            self._gamepad.update()
+            self._pad_prev = set(self._gamepad.buttons)
+            self._pad_timer.start()
+
+    def focusOutEvent(self, ev) -> None:  # noqa: N802
+        self._pad_timer.stop()
+        super().focusOutEvent(ev)
+
+    def _poll_gamepad(self) -> None:
+        if self._gamepad is None:
+            return
+        self._gamepad.update()
+        buttons = set(self._gamepad.buttons)
+        pressed = buttons - self._pad_prev
+        self._pad_prev = buttons
+        if not (self.hasFocus() and self.isVisible() and self.window().isActiveWindow()):
+            return
+        if pressed:
+            key = next(k for k in sr.BUTTON_LABELS if k in pressed)
+            self._apply(key)
 
 
 class KeyBox(QWidget):
@@ -706,14 +783,15 @@ class KeyBox(QWidget):
 
     key_changed = Signal(str)
 
-    def __init__(self, value: str = "", width: int = 128) -> None:
+    def __init__(self, value: str = "", width: int = 128,
+                 allow_gamepad: bool = False) -> None:
         super().__init__()
         self.setObjectName("KeyBox")
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(4)
 
-        self.edit = _KeyEdit(value, max(56, width - 24))
+        self.edit = _KeyEdit(value, max(56, width - 24), allow_gamepad)
         lay.addWidget(self.edit, 1)
 
         self.btn_clear = QPushButton("✕")
@@ -1706,7 +1784,8 @@ class ComboEditorDialog(QDialog):
         row_b.addWidget(self.spn_cool)
         row_b.addWidget(self.spn_voices)
         row_b.addWidget(QLabel("专属热键"))
-        self.key_combo = KeyBox(self.scfg.combo_setting(cdef.cid).hotkey, 128)
+        self.key_combo = KeyBox(self.scfg.combo_setting(cdef.cid).hotkey, 128,
+                                allow_gamepad=True)
         self.key_combo.setToolTip("这个组合不必占轮盘格子，单手一个键直接触发")
         row_b.addWidget(self.key_combo)
         row_b.addStretch(1)
@@ -2614,6 +2693,8 @@ class HotkeyPage(QWidget):
         card3, l3 = _card("音效直按键")
         hint = QLabel(
             "每个音效可以单独绑一个键，按下直接播放，不用开轮盘。\n"
+            "支持 Xbox 手柄（蓝牙/有线）：点音效的快捷键框，再按手柄按钮。\n"
+            "也支持滚轮上下、单独绑一个 Alt / Shift / Ctrl（只按一下就绑上）。\n"
             "在右下角那张音效卡片的「快捷键」里设置，下面两行「触发 / 条件」\n"
             "决定它是按下就响、按住才响、松手才响，还是要先按解锁键。\n"
             "同一个键可以挂好几个音效（比如长按左键播组合、松手左键播另一句），\n"
@@ -3800,6 +3881,27 @@ class HelpPage(QWidget):
             "· 条件解锁时是「停 + 上锁」；无条件音效设了它就是「按一下就停」。\n"
             "· 按住不放只停一次；好几个音效填同一个停止键，按一下一起停。"
         )
+        s3.para("打断（连击时停掉上一次，v0.9.1 新增）", "head")
+        s3.para(
+            "· 同一个音效还没放完就又按了一次，两次怎么处理，由「打断」那一行决定。\n"
+            "· 不勾（默认）：两声叠在一起响。笑声、喊声这种越叠越热闹的适合这样。\n"
+            "· 勾上：先把上一声掐掉，再从头放。长句子、整段台词建议勾 —— "
+            "不然连按会听见几层不同进度糊在一起。\n"
+            "· 只影响这一个格子；快捷键、轮盘点选、长按连发都按它执行。"
+        )
+        s3.para("手柄（v0.9.1 新增）", "head")
+        s3.para(
+            "· 音效和组合的「快捷键」框都能录 Xbox 手柄：点进框，按一下手柄按钮，"
+            "框里显示「手柄 A」就是绑好了。\n"
+            "· 认 A/B/X/Y、LB/RB、LT/RT（按过一半算按下）、十字键、左右摇杆按下、"
+            "View/Menu；蓝牙和有线都行。\n"
+            "· 手柄按钮就是一个普通按键：触发方式、全局通用、条件解锁/停止都照常生效；"
+            "每个音效仍然只有一个快捷键，录了手柄会替换掉键盘绑定。\n"
+            "· 断线时正在长按/连发的声音会直接结束，不会当成「松手」再放一声；"
+            "重连约一秒内恢复，连上时按着的按钮要先松开。\n"
+            "· 程序只读手柄，不拦游戏；轮盘的呼出和轮盘里选择仍然用键盘/鼠标。"
+        )
+
         s3.para("一个现成玩法：长按播组合、松手播另一句", "head")
         s3.para(
             "1. 建组合「AAA」，挂鼠标左键，「触发」选长按触发；「条件」选条件解锁，"
@@ -4338,8 +4440,8 @@ class SlotDetail(QFrame):
         self.setObjectName("Card")
         # 高度写死，免得内容增减时面板自己跳；改动行数后记得同步这个值
         # 188 → 246：v0.9 加了「触发」和「条件」两行
-        # 246 → 270：v0.9.0 又加了「停止」一行（实测要 223，246 会把行距压没）
-        self.setFixedHeight(270)
+        # 250 → 290：v0.9.1 又多了「打断」一行（实测要 283）
+        self.setFixedHeight(290)
 
         lay = QVBoxLayout(self)
         # v0.9：多了「触发 / 条件」两行，上下留白和行距都收一点，
@@ -4463,7 +4565,7 @@ class SlotDetail(QFrame):
         hl.setFixedWidth(52)
         hl.setStyleSheet("color:#a9b0c0;font-size:12px;")
         win_row.addWidget(hl)
-        self.hotkey = KeyBox("", 116)
+        self.hotkey = KeyBox("", 116, allow_gamepad=True)
         win_row.addWidget(self.hotkey)
         # 全局通用：勾上之后这个键不再跟着轮盘走。组合音效也有这一项 ——
         # 组合的定义全盘共用，但"这个键在别的盘上还算不算数"仍然要单独决定。
@@ -4612,6 +4714,29 @@ class SlotDetail(QFrame):
         stop_row.addStretch(1)
         body.addLayout(stop_row)
 
+        # ---- 连击时是否打断上一声（v0.9.1）----
+        # 和「条件」无关：这是"同一个音效连着按"的时候，新的要不要把旧的掐掉。
+        # 默认不掐（叠加），勾上就变成"每按一次都从头来"。
+        cut_row = QHBoxLayout()
+        self.lbl_cut = cl = QLabel("打断")
+        cl.setFixedWidth(52)
+        cl.setStyleSheet("color:#a9b0c0;font-size:12px;")
+        cut_row.addWidget(cl)
+        self.chk_stop_prev = QCheckBox("连击时停掉上一次")
+        self.chk_stop_prev.setObjectName("GlobalChk")
+        self.chk_stop_prev.setToolTip(
+            "勾上之后：同一个音效还没放完就再按一次，会先把上一声掐掉再重新开始。\n"
+            "不勾（默认）：两声叠在一起响，适合笑声、喊声这种越叠越热闹的。\n"
+            "对快捷键、轮盘点选、长按连发都生效；只影响这一个格子。"
+        )
+        cut_row.addWidget(self.chk_stop_prev)
+        cut_row.addSpacing(8)
+        self.lbl_cut_hint = QLabel("不勾就叠着响")
+        self.lbl_cut_hint.setObjectName("Hint")
+        cut_row.addWidget(self.lbl_cut_hint)
+        cut_row.addStretch(1)
+        body.addLayout(cut_row)
+
         lay.addWidget(self.body)
         lay.addStretch(1)
 
@@ -4631,6 +4756,7 @@ class SlotDetail(QFrame):
         self.unlock_key.key_changed.connect(lambda _v: self._push())
         self.unlock_ms.valueChanged.connect(self._push)
         self.unlock_count.valueChanged.connect(self._push)
+        self.chk_stop_prev.toggled.connect(self._push)
         self.btn_play.clicked.connect(
             lambda: self.current and self.preview_requested.emit(self.current)
         )
@@ -4660,6 +4786,7 @@ class SlotDetail(QFrame):
             self.unlock_count.setValue(0)
             self._set_stop_keys([])
             self.chk_global.setChecked(False)
+            self.chk_stop_prev.setChecked(False)
         else:
             self.title.setText(
                 self.scfg.display_name(name) if self._is_combo else Path(name).stem
@@ -4688,6 +4815,7 @@ class SlotDetail(QFrame):
             self.speed_step.setCurrentIndex(max(0, si2))
             self.hotkey.set_key(st.hotkey)
             self.chk_global.setChecked(bool(getattr(st, "global_hotkey", False)))
+            self.chk_stop_prev.setChecked(bool(getattr(st, "stop_prev", False)))
 
             # ---- 触发方式 / 触发条件 ----
             ti = self.trigger_mode.findData(st.trigger_mode)
@@ -4707,7 +4835,7 @@ class SlotDetail(QFrame):
                   self.trigger_mode, self.repeat_ms,
                   self.unlock_mode, self.unlock_key,
                   self.unlock_ms, self.unlock_count,
-                  self.chk_global):
+                  self.chk_global, self.chk_stop_prev):
             w.setEnabled(name is not None)
         # 停止键框是动态建的，逐个置灰（加号按钮在 _sync_stop_ui 里管）
         self.stop_holder.setEnabled(name is not None)
@@ -4890,6 +5018,7 @@ class SlotDetail(QFrame):
         st.unlock_ms = int(self.unlock_ms.value())
         st.unlock_count = int(self.unlock_count.value())
         st.stop_keys = [b.key_name for b in self._stop_boxes if b.key_name]
+        st.stop_prev = bool(self.chk_stop_prev.isChecked())
         if self._is_combo:
             # 组合没有"整体变调/速度"这回事，逐项参数归编辑器管
             st.hotkey = self.hotkey.key_name
@@ -5016,8 +5145,9 @@ class SettingsWindow(QWidget):
         # 高度 780 → 840：v0.9 的音效卡片多了「触发」「条件」两行，
         # 不把窗口放高一点，右下角那块和轮盘预览会互相挤
         # 840 → 880：v0.9.0 又多了「停止」一行（卡片 246 → 270）
-        self.resize(1120, 880)
-        self.setMinimumSize(980, 840)
+        # 880 → 900：v0.9.1 又多了「打断」一行（卡片 270 → 290）
+        self.resize(1120, 900)
+        self.setMinimumSize(980, 860)
         self.setStyleSheet(build_qss())
 
         outer = QVBoxLayout(self)
