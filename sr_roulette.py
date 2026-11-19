@@ -121,7 +121,13 @@ from PySide6.QtMultimedia import (
     QMediaDevices,
     QMediaPlayer,
 )
-from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QMenu,
+    QMessageBox,
+    QSystemTrayIcon,
+    QWidget,
+)
 
 from sounds_config import (
     COMBO_PREFIX,
@@ -149,11 +155,12 @@ from sounds_config import (
     SoundsConfig,
     is_combo_key,
 )
+import sounds_config as _sounds_config
 import theme
 from theme import accent, accent_dark, accent_light, set_accent
 
 APP_NAME = "SR Voiceover Roulette"
-APP_VERSION = "v0.9.1"
+APP_VERSION = "v0.9.2"
 
 DEBUG = os.environ.get("SR_DEBUG") == "1"
 
@@ -887,6 +894,10 @@ def _log(msg: str) -> None:
             pass
 
 
+# sounds_config 是独立模块（要能单独测），日志出口在这里接上
+_sounds_config.set_logger(_log)
+
+
 DEFAULT_CONFIG = {
     "config_version": CONFIG_VERSION,
     "hotkey": "y",
@@ -935,6 +946,8 @@ DEFAULT_CONFIG = {
     "autostart": False,
     # 首次启动那张「去看看常见问题」的引导卡看过没有（看过就不再弹）
     "help_tip_shown": False,
+    # 配置窗口的大小和位置 [x, y, w, h]（v0.9.2：窗口可以自由缩放，下次打开还原）
+    "settings_geom": [],
     # ---- 麦克风注入（要把音效送进游戏语音，必须有虚拟声卡，比如 VB-CABLE）----
     "mic_enabled": False,
     "mic_device": "",         # 采集设备名，空 = 自动挑一个真实麦克风
@@ -3810,7 +3823,21 @@ class WheelWidget(QWidget):
         fm1 = QFontMetrics(f1)
         if getattr(self, "embedded", False):
             # 配置窗口里的预览：文案要讲"编辑"，不能讲"松开播放"
-            if selected is None:
+            hint = getattr(self, "center_hint", "")
+            if hint:
+                # 拖着音效到中心：提示放主标题（大字 + 强调色），一眼能看到；
+                # 小字说明松手之后会发生什么
+                fh = QFont(UI_FONT)
+                fh.setPointSizeF(max(6.0, 9.0 * s))
+                fh.setWeight(QFont.DemiBold)
+                p.setFont(fh)
+                p.setPen(QPen(accent_light(255)))
+                main_hint = QFontMetrics(fh).elidedText(
+                    hint, Qt.ElideRight, int(inner * 2.0)
+                )
+                # 只有真的停在中心才说"追加到末尾"，还在扇区上就留空
+                sub_hint = getattr(self, "center_sub_hint", "") or ""
+            elif selected is None:
                 main_hint = "点击扇区"
                 sub_hint = f"共 {n} 个音效"
             else:
@@ -3818,9 +3845,6 @@ class WheelWidget(QWidget):
                     self.bank.name_at(selected), Qt.ElideRight, int(inner * 1.6)
                 )
                 sub_hint = "正在编辑这一个"
-            # 预览会把"拖到中心要干什么"塞到这一行（例如“＋ 添加到末尾”），
-            # 免得另起一行文字和音效名挤在一起
-            sub_hint = getattr(self, "center_hint", "") or sub_hint
         elif not self.raw_ok:
             main_hint = "鼠标输入不可用"
             sub_hint = "请查看 sr_roulette.log"
@@ -5471,9 +5495,11 @@ def main() -> int:
     scfg.load()
 
     bank = SoundBank(MAX_SLOTS, scfg)   # 内 8 + 外 12，上限写死在 sounds_config
-    # 首次运行会把磁盘上的音效全数上盘，这里立刻落盘固化，
-    # 否则每次启动都当作"首次"，用户对轮盘的改动会被全量上盘盖掉
-    scfg.save()
+    # 首次运行会把磁盘上的音效全数上盘，这里落盘固化，否则每次启动都当作"首次"，
+    # 用户对轮盘的改动会被全量上盘盖掉。
+    # 只有真的动了才写：一次扫描异常（目录暂时读不到之类）不该顺手把配置写花。
+    if scfg.dirty:
+        scfg.save()
     audio = AudioEngine(bank, cfg)
     audio.start()
     # 启动后隔一会儿把组合音效预渲染进缓存（一条一条来，不卡启动）
@@ -5605,6 +5631,39 @@ def main() -> int:
 
     act_reload.triggered.connect(do_reload)
     menu.addAction(act_reload)
+
+    act_refill = QAction("把 sounds 里的音效全部放回轮盘（修复用）", menu)
+
+    def do_refill() -> None:
+        """配置和磁盘对不上时的救命键：按磁盘重建轮盘。
+
+        典型场景：解压新版本时把 sounds.json 覆盖成了默认那份，自己攒的音效
+        文件都还在、但轮盘上只剩示例；或者手改坏了配置。
+        """
+        ret = QMessageBox.question(
+            None, "全部放回轮盘",
+            "会按 sounds 目录里的文件重新排满轮盘（最多 %d 个）。\n"
+            "每个音效原有的音量 / 变调 / 快捷键 / 条件都会保留，\n"
+            "只是「哪些音效在轮盘上」按磁盘重来。继续吗？" % MAX_SLOTS,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if ret != QMessageBox.Yes:
+            return
+        names = [key for key, _p in scan_sound_files()]
+        # 当作"首次运行"：sync 会把磁盘上的文件全数上盘
+        scfg._initialized = False
+        scfg.sync(names)
+        scfg.save()
+        bank.reload()
+        audio.load()
+        act_count.setText(f"已加载音效：{len(audio)} 个（上限 {MAX_SLOTS}）")
+        hint_toast.show_hint(f"已按磁盘重建轮盘：{len(bank)} 个音效上盘", "warn", 5000)
+        win = _settings_holder.get("win")
+        if win is not None and hasattr(win, "on_wheel_switched"):
+            win.on_wheel_switched()
+
+    act_refill.triggered.connect(do_refill)
+    menu.addAction(act_refill)
 
     act_open = QAction("打开 sounds 目录", menu)
 

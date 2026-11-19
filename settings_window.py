@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.wintypes
 import json
 import math
 import os
@@ -13,6 +15,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from PySide6.QtCore import (
+    QEvent,
     QMimeData,
     QPoint,
     QPointF,
@@ -25,6 +28,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QColor,
+    QCursor,
     QDrag,
     QFont,
     QIcon,
@@ -531,6 +535,34 @@ QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
 
 # ---------------------------------------------------------------- 小部件
 
+# 无边框窗口的缩放：窗口整块都当普通客户区，边缘判定、光标形状、拖动缩放
+# 全在 Qt 层自己做。
+#
+# ★ 走过的弯路：一开始让窗口接 WM_NCHITTEST 回缩放区域码，想让系统自己当边框。
+#   结果系统把边缘算成"非客户区"之后，Qt 就不再产生普通鼠标按下事件，
+#   按下处理收不到，缩放循环也就起不来 —— 表现是"光标不变、按下去也不动"。
+#   所以现在不碰系统 hit-test，见 SettingsWindow._edges_at / mousePressEvent。
+_RESIZE_BORDER = 6      # 距离窗口边缘多少像素算"贴着边"（逻辑像素）
+
+
+def _cursor_for_edges(edges):
+    """缩放边缘 -> 对应的鼠标形状；不在边上就返回 None。"""
+    if not edges:
+        return None
+    left = bool(edges & Qt.LeftEdge)
+    right = bool(edges & Qt.RightEdge)
+    top = bool(edges & Qt.TopEdge)
+    bottom = bool(edges & Qt.BottomEdge)
+    if (left and top) or (right and bottom):
+        return Qt.SizeFDiagCursor
+    if (right and top) or (left and bottom):
+        return Qt.SizeBDiagCursor
+    if left or right:
+        return Qt.SizeHorCursor
+    if top or bottom:
+        return Qt.SizeVerCursor
+    return None
+
 _QT_TO_KEY = {
     Qt.Key_Space: "space",
     Qt.Key_Tab: "tab",
@@ -940,6 +972,9 @@ class TitleBar(QWidget):
         self.setObjectName("TitleBar")
         self.setFixedHeight(46)
         self._drag_from: QPoint | None = None
+        # 顶边那 6 像素压在标题栏上：不开 tracking 就收不到"没按键的移动"，
+        # 光标也就不会变成上下箭头
+        self.setMouseTracking(True)
 
         lay = QHBoxLayout(self)
         lay.setContentsMargins(18, 0, 12, 0)
@@ -971,13 +1006,39 @@ class TitleBar(QWidget):
         self.btn_close.setCursor(Qt.PointingHandCursor)
         lay.addWidget(self.btn_close)
 
+    def _win_edges(self, pos):
+        """标题栏上的点 -> 窗口缩放边缘（窗口坐标系，靠 _edges_at 统一算）。"""
+        win = self.window()
+        fn = getattr(win, "_edges_at", None)
+        if fn is None:
+            return None
+        return fn(win.mapFromGlobal(self.mapToGlobal(pos)))
+
     def mousePressEvent(self, e) -> None:  # noqa: N802
         if e.button() == Qt.LeftButton:
+            edges = self._win_edges(e.position().toPoint())
+            # 标题栏正好压着窗口顶边：这 6 像素要让给缩放，不能拿来拖窗口
+            if edges:
+                begin = getattr(self.window(), "begin_resize", None)
+                if begin is not None and begin(edges, e.globalPosition().toPoint()):
+                    e.accept()
+                    return
             self._drag_from = e.globalPosition().toPoint() - self.window().frameGeometry().topLeft()
 
     def mouseMoveEvent(self, e) -> None:  # noqa: N802
+        win = self.window()
+        if getattr(win, "_rs_active", False) and e.buttons() & Qt.LeftButton:
+            win._apply_manual_resize(e.globalPosition().toPoint())
+            return
         if self._drag_from is not None and e.buttons() & Qt.LeftButton:
-            self.window().move(e.globalPosition().toPoint() - self._drag_from)
+            win.move(e.globalPosition().toPoint() - self._drag_from)
+            return
+        self.setCursor(
+            _cursor_for_edges(self._win_edges(e.position().toPoint())) or Qt.ArrowCursor
+        )
+
+    def leaveEvent(self, e) -> None:  # noqa: N802
+        self.setCursor(Qt.ArrowCursor)
 
     def mouseReleaseEvent(self, e) -> None:  # noqa: N802
         self._drag_from = None
@@ -1107,6 +1168,9 @@ class LibraryPage(QWidget):
     combo_new = Signal()
     combo_edit = Signal(str)     # cid
     combo_delete = Signal(str)   # cid
+    # 库里有东西被拖起来 / 拖拽结束（转发给轮盘预览点亮中心）
+    drag_began = Signal()
+    drag_ended = Signal()
 
     def __init__(self, bank: sr.SoundBank, scfg=None) -> None:
         super().__init__()
@@ -1130,9 +1194,24 @@ class LibraryPage(QWidget):
         bar.addWidget(self.btn_folder)
         root.addLayout(bar)
 
-        hint = QLabel("拖动格子到右侧轮盘添加；把轮盘上的音效拖回这里可移除")
+        fbar = QHBoxLayout()
+        fbar.setSpacing(8)
+        self.folder_filter = QComboBox()
+        self.folder_filter.setMinimumWidth(132)
+        self.folder_filter.setToolTip("只看某个文件夹里的音效（和右边的搜索同时生效）")
+        self.folder_filter.currentIndexChanged.connect(lambda _i: self.refresh())
+        fbar.addWidget(self.folder_filter)
+        hint = QLabel("拖动格子到右侧轮盘添加")
         hint.setObjectName("Hint")
-        root.addWidget(hint)
+        fbar.addWidget(hint, 1)
+        root.addLayout(fbar)
+
+        self.lbl_parked = QLabel()
+        self.lbl_parked.setWordWrap(True)
+        self.lbl_parked.setStyleSheet("color:#ffb45c;font-size:11px;")
+        self.lbl_parked.hide()
+        root.addWidget(self.lbl_parked)
+
         self.search.textChanged.connect(lambda _t: self.refresh())
 
         self.scroll = QScrollArea()
@@ -1143,6 +1222,9 @@ class LibraryPage(QWidget):
         self.grid.setContentsMargins(0, 0, 6, 0)
         self.grid.setSpacing(8)
         self.grid.setAlignment(Qt.AlignTop)
+        # 两列平分宽度：格子自己不对宽度提要求，长文件名才不会把右边挤出去
+        self.grid.setColumnStretch(0, 1)
+        self.grid.setColumnStretch(1, 1)
         self.scroll.setWidget(holder)
         root.addWidget(self.scroll, 1)
 
@@ -1175,6 +1257,8 @@ class LibraryPage(QWidget):
         self.combo_list.setFixedHeight(104)
         self.combo_list.edit_requested.connect(self.combo_edit.emit)
         self.combo_list.delete_requested.connect(self.combo_delete.emit)
+        self.combo_list.drag_began.connect(self.drag_began.emit)
+        self.combo_list.drag_ended.connect(self.drag_ended.emit)
         root.addWidget(self.combo_list)
 
         chint = QLabel("双击组合可编辑；把组合拖到右侧轮盘，就能像普通音效一样用")
@@ -1194,7 +1278,10 @@ class LibraryPage(QWidget):
         # 递归扫描：子文件夹里的音效也列出来，用户可以用文件夹分类整理
         found = sr.scan_sound_files()
         total = len(found)
+        self._fill_folder_filter(found)
+        self._refresh_parked_hint()
         kw = self.search.text().strip().lower()
+        sel = self.folder_filter.currentData() if self.folder_filter.count() else None
 
         # 轮盘上已经有的（按相对路径比，子文件夹里的同名文件不会互相顶替）
         on_wheel = {
@@ -1202,10 +1289,21 @@ class LibraryPage(QWidget):
         } if (self.scfg is not None and len(self.bank) > 0) else set()
 
         if not found:
-            empty = QLabel(
-                "sounds 目录里还没有音效。\n"
-                "点上面的「打开文件夹」，把音频文件放进去，再回来就能看到了。"
-            )
+            if self.scfg is not None and getattr(self.scfg, "scan_suspicious", False) \
+                    and len(self.scfg.order):
+                msg = (
+                    "这次一个音效都没扫到，但配置里还有 "
+                    f"{len(self.scfg.order)} 个 —— 已按「扫描异常」处理，"
+                    "轮盘和参数都原样保留，没有清空。\n"
+                    "如果 sounds 目录确实空了（比如放在了还没连上的移动硬盘里），"
+                    "插好设备后点这里刷新，或者重新打开这个窗口。"
+                )
+            else:
+                msg = (
+                    "sounds 目录里还没有音效。\n"
+                    "点上面的「打开文件夹」，把音频文件放进去，再回来就能看到了。"
+                )
+            empty = QLabel(msg)
             empty.setObjectName("Hint")
             empty.setAlignment(Qt.AlignCenter)
             empty.setWordWrap(True)
@@ -1218,10 +1316,16 @@ class LibraryPage(QWidget):
             if kw and kw not in path.stem.lower():
                 continue
             group = key.rsplit("/", 1)[0] if "/" in key else ""
+            if sel is not None and group != sel:
+                continue
             groups.setdefault(group, []).append((key, path))
 
         if not groups:
-            empty = QLabel(f"没有匹配「{kw}」的音效。")
+            if sel is not None:
+                msg = f"「{sel or '根目录'}」里没有匹配的音效。"
+            else:
+                msg = f"没有匹配「{kw}」的音效。"
+            empty = QLabel(msg)
             empty.setObjectName("Hint")
             empty.setAlignment(Qt.AlignCenter)
             empty.setWordWrap(True)
@@ -1245,11 +1349,54 @@ class LibraryPage(QWidget):
                 row += 1
             for col, (key, path) in enumerate(items):
                 cell = _SoundCell(num, path, key in on_wheel)
+                cell.drag_began.connect(self.drag_began.emit)
+                cell.drag_ended.connect(self.drag_ended.emit)
                 self.grid.addWidget(cell, row + col // 2, col % 2)
                 num += 1
             row += (len(items) + 1) // 2
 
         self.refresh_combos()
+
+    def _fill_folder_filter(self, found) -> None:
+        """把 sounds 里出现过的文件夹填进筛选框，尽量保住用户当前选的那个。"""
+        folders: list[str] = []
+        has_root = False
+        for key, _path in found:
+            if "/" in key:
+                group = key.rsplit("/", 1)[0]
+            else:
+                has_root = True
+                continue
+            if group not in folders:
+                folders.append(group)
+        folders.sort(key=str.lower)
+
+        prev = self.folder_filter.currentData() if self.folder_filter.count() else None
+        self.folder_filter.blockSignals(True)   # 重建时别触发 refresh，不然会递归
+        self.folder_filter.clear()
+        self.folder_filter.addItem("全部文件夹")
+        if has_root:
+            self.folder_filter.addItem("根目录", "")
+        for group in folders:
+            self.folder_filter.addItem(group, group)
+        idx = self.folder_filter.findData(prev) if prev is not None else 0
+        if idx < 0:      # 之前选中的文件夹已经空了，退回"全部"
+            idx = 0
+        self.folder_filter.setCurrentIndex(max(0, idx))
+        self.folder_filter.blockSignals(False)
+
+    def _refresh_parked_hint(self) -> None:
+        """文件暂时不在的音效不该让用户以为"设置丢了"，明说着在。"""
+        n = len(getattr(self.scfg, "parked", {}) or {}) if self.scfg is not None else 0
+        if n:
+            self.lbl_parked.setText(
+                f"有 {n} 个音效这次在 sounds 目录里没找到，"
+                "它们的设置（音量、变调、快捷键、条件）都保留着，"
+                "把文件放回原处就会自动恢复。"
+            )
+            self.lbl_parked.show()
+        else:
+            self.lbl_parked.hide()
 
     def refresh_combos(self) -> None:
         """刷新底部组合列表：名字、成员数、播放方式、是否已在轮盘。"""
@@ -1330,13 +1477,63 @@ def _duration_text(path: Path) -> str:
     return f"{dur:.2f} 秒" if dur > 0 else "—"
 
 
+class _ElideLabel(QLabel):
+    """放不下就用省略号，鼠标悬停看全名。
+
+    音效库的格子宽度由两列平分决定，不能被文字撑开：文件名一长（比如
+    `Surround+Sound+(Explicit)-JJD&21+Savage&Baby+Tate_metool (1)`），
+    QLabel 的 sizeHint 就会把整列顶宽，横向滚动条又是关掉的，右边那一列
+    直接被裁出可视区。所以这里让 label 不参与宽度计算，只按实际分到的宽度
+    把文字截断。
+    """
+
+    def __init__(self, text: str = "", parent=None) -> None:
+        super().__init__(parent)
+        self._full = text
+        self.setTextFormat(Qt.PlainText)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.setMinimumWidth(0)
+        self.setToolTip(text)
+        self.setText(text)
+
+    def set_full_text(self, text: str) -> None:
+        self._full = text
+        self.setToolTip(text)
+        self._fit_text()
+
+    def resizeEvent(self, e) -> None:  # noqa: N802
+        super().resizeEvent(e)
+        self._fit_text()
+
+    def _fit_text(self) -> None:
+        full = getattr(self, "_full", "") or ""
+        width = max(0, self.contentsRect().width())
+        if width <= 0:
+            return
+        # 多留 2px：字体度量偶尔比实际绘制宽一点点，不然最后一个字符会被切一半
+        shown = self.fontMetrics().elidedText(full, Qt.ElideRight, width - 2)
+        if shown != self.text():
+            self.setText(shown)
+
+
 class _SoundCell(QFrame):
-    """音效库里的一格。按住拖到右边轮盘即可上盘。"""
+    """音效库里的一格。按住拖到右边轮盘即可上盘。
+
+    drag_began / drag_ended 把"这一趟拖拽开始了"广播出去，让轮盘预览
+    能在抓起音效的瞬间就点亮中心 —— 光靠拖放事件不够，因为那要等
+    鼠标真的移进轮盘才会来。
+    """
+
+    drag_began = Signal()
+    drag_ended = Signal()
 
     def __init__(self, index: int, path: Path, on_wheel: bool = False) -> None:
         super().__init__()
         self.setObjectName("Cell")
         self.setFixedHeight(62)
+        # 宽度交给网格的两列去分，自己不对宽度提要求（见 _ElideLabel 的说明）
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.setMinimumWidth(0)
         self.setCursor(Qt.OpenHandCursor)
         self.path = path
         self.on_wheel = on_wheel
@@ -1360,11 +1557,11 @@ class _SoundCell(QFrame):
 
         col = QVBoxLayout()
         col.setSpacing(2)
-        name = QLabel(path.stem)
+        name = _ElideLabel(path.stem)
         name.setStyleSheet("font-size:12px;color:#e8eaf0;background:transparent;")
         col.addWidget(name)
         tail = " · 已在轮盘" if on_wheel else ""
-        meta = QLabel(f"{path.suffix.upper().lstrip('.')} · {_duration_text(path)}{tail}")
+        meta = _ElideLabel(f"{path.suffix.upper().lstrip('.')} · {_duration_text(path)}{tail}")
         meta.setObjectName("Hint")
         if on_wheel:
             meta.setStyleSheet(f"color:{accent_hex()};font-size:11px;background:transparent;")
@@ -1389,7 +1586,12 @@ class _SoundCell(QFrame):
         drag = QDrag(self)
         drag.setMimeData(mime)
         drag.setPixmap(_drag_pixmap(self.path.stem))
-        drag.exec(Qt.CopyAction)
+        self.drag_began.emit()
+        try:
+            drag.exec(Qt.CopyAction)
+        finally:
+            # exec 在松手/取消/拖到窗口外之后才返回，异常也不能让中心一直亮着
+            self.drag_ended.emit()
 
     def mouseReleaseEvent(self, e) -> None:  # noqa: N802
         self._press = None
@@ -1404,6 +1606,8 @@ class _ComboList(QListWidget):
 
     edit_requested = Signal(str)
     delete_requested = Signal(str)
+    drag_began = Signal()
+    drag_ended = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -1432,7 +1636,11 @@ class _ComboList(QListWidget):
         drag = QDrag(self)
         drag.setMimeData(mime)
         drag.setPixmap(_drag_pixmap(item.text().split("    ")[0]))
-        drag.exec(Qt.CopyAction)
+        self.drag_began.emit()
+        try:
+            drag.exec(Qt.CopyAction)
+        finally:
+            self.drag_ended.emit()
 
 
 class _ComboTimeline(QWidget):
@@ -3844,7 +4052,8 @@ class HelpPage(QWidget):
             (
                 "3｜拖上轮盘",
                 "设置窗口 →「音效库」→ 把音效拖到轮盘格子上。内圈 8 格，满了自动用外圈，最多 20 格。"
-                "拖到中间圆 = 追加到末尾；把轮盘上的格子拖回音效库 = 下盘（文件还在）。\n"
+                "一抓起音效，轮盘中间就会亮起来并写着「拖到此处添加音效」（不用等到拖进轮盘），"
+                "拖到中间松手就追加到末尾；把轮盘上的格子拖回音效库 = 下盘（文件还在）。\n"
                 "压缩包里已经排好一组示例，随便改。你自己删掉或下盘的音效不会自己补回来"
                 "（想把整盘重置，就删掉 sounds.json 再启动）。",
             ),
@@ -3971,6 +4180,34 @@ class HelpPage(QWidget):
             "· 仍然绑不了：Delete / Backspace（在这两个框里它们是「清空绑定」的意思）、"
             "单独 Win 键（跟开始菜单抢）、多媒体键（音量、播放那些）、Fn、输入法转换键 —— "
             "这几个系统层就不当普通按键发出来，程序收不到，不是漏做。"
+        )
+        s3.para("窗口大小（v0.9.2 新增）", "head")
+        s3.para(
+            "· 鼠标贴到窗口边上会变成双箭头，按住就能拖大拖小（八个方向都行）。\n"
+            "· 拉大之后左边的音效库跟着变宽（最多 760px），格子里能看到的字更多；\n"
+            "  最小 980×860，再小右下角的参数卡片就放不下了。\n"
+            "· 关掉窗口时会记住大小和位置，下次打开还是这样。换了显示器或分辨率变小，\n"
+            "  窗口会自动挪回屏幕内，不会跑到看不见的地方。"
+        )
+        s3.para("音效库筛选（v0.9.2 新增）", "head")
+        s3.para(
+            "· 搜索框下面多了一个文件夹下拉框：默认「全部文件夹」，选「根目录」只看第一层，\n"
+            "  选某个子文件夹就只看那一坨。\n"
+            "· 和搜索框叠加生效：先选文件夹再打关键字，范围更小更快。\n"
+            "· 文件名太长会用省略号结尾（鼠标停上去看全名），格子宽度不会再被长名字\n"
+            "  撑开、把右边那一列挤出窗口 —— 这是 v0.9.2 修掉的一个老毛病。"
+        )
+        s3.para("音效「自己没了」？先看这里（v0.9.2 加固）", "head")
+        s3.para(
+            "· sounds.json 旁边现在会有 sounds.json.bak（上一次配置的备份）。\n"
+            "  主文件读不出来（写到一半断电、被杀、手改坏）会自动用备份顶上。\n"
+            "· 文件只是暂时不在（网盘没同步下来、移动硬盘没插）时，它的参数不会被删，\n"
+            "  而是收进配置的「暂存区」。把文件放回 sounds、名字不变，它会自动回到\n"
+            "  轮盘原来的位置，音量/变调/快捷键/条件全都还在。\n"
+            "· 有暂存项时，音效库顶部会有一行橙色提示。\n"
+            "· 如果某次启动一个音效都没扫到（比如 sounds 在没插上的硬盘里），\n"
+            "  程序不会当成「你把它们删了」，配置原封不动。\n"
+            "· 真要恢复出厂：删掉 sounds.json 再启动，会按 sounds 里的文件重新排满。"
         )
         s3.para("手柄（v0.9.1 新增）", "head")
         s3.para(
@@ -4313,6 +4550,12 @@ class WheelPreview(sr.WheelWidget):
         self._press_idx: int | None = None     # 音效下标（能不能拖/点）
         self._press_sid: int | None = None     # 槽位号（拖出去要带的位置）
         self._dragging = False
+        # 这一趟拖拽是从音效库来的吗？决定中心提示说"添加"还是"移到末尾"
+        self._drag_from_lib = True
+        # 音效库里是不是正拖着一个东西（由 QDrag.exec 的生命周期驱动）。
+        # 刻意不用"鼠标进没进轮盘"来判：用户要的是一开始拖就亮中心，
+        # 光标还在左边的音效库上方时也应该看见"拖到此处添加音效"。
+        self._lib_drag = False
 
     # ---- 几何 ----
     def _center(self) -> tuple[float, float]:
@@ -4326,10 +4569,39 @@ class WheelPreview(sr.WheelWidget):
 
     @property
     def center_hint(self) -> str:
-        """拖到中心时，中心那行小字改成"添加到末尾"。"""
-        if self.drop_target == ADD_TO_END:
-            return "＋ 添加到末尾"
+        """拖音效进来时中心显示什么。
+
+        只要是从音效库拖起来的，中心就从头到尾提示 —— 不等鼠标进轮盘，
+        也不等它走到中心。用户抓起一个音效的瞬间就该知道往哪儿放。
+        """
+        if self._lib_drag and self._drag_from_lib:
+            return "拖到此处添加音效"
         return ""
+
+    @property
+    def center_sub_hint(self) -> str:
+        """中心下面那行小字；还没停在中心时不写，免得和"放进这一格"打架。"""
+        if self._lib_drag and self._drag_from_lib and self.drop_target == ADD_TO_END:
+            return "松手追加到末尾"
+        return ""
+
+    # ---- 库里的拖拽开始/结束（外部驱动）----
+
+    def begin_lib_drag(self) -> None:
+        """音效库那边刚把一个音效拖起来：立刻点亮中心。
+
+        必须同步重绘（repaint 而不是 update）：调用方紧接着就进
+        QDrag.exec() 阻塞了，排队的重绘要等到拖完才画，等于没亮。
+        """
+        self._lib_drag = True
+        self._drag_from_lib = True
+        self.repaint()
+
+    def end_lib_drag(self) -> None:
+        """拖拽结束（松手、取消、拖到窗口外都算）：熄灯。"""
+        self._lib_drag = False
+        self.drop_target = None
+        self.update()
 
     def ring_geometry(self) -> tuple[dict, float]:
         """当前预览的环布局 + 缩放比（只是预览框的适配比例）。
@@ -4379,17 +4651,19 @@ class WheelPreview(sr.WheelWidget):
             return None
         return sr.index_of_slot(sid, self.count(), sr.outer_index_map_of(self.bank))
 
-    def _target_at(self, pos: QPoint) -> int | None:
+    def _target_at(self, pos: QPoint, from_lib: bool = True) -> int | None:
         """拖放落点：槽位号（放/换到那一格）、ADD_TO_END（追加）、None（不接受）。
 
         外圈的任意位置都收 —— 空格子能放进去，有内容的两格互换。
+        中心只收"从音效库拖进来"的添加：轮盘内拖到中心没有任何意义
+        （那里不是槽位，swap_slots 也不认负目标），拒绝掉比给个假提示好。
         """
         geo, _ = self.ring_geometry()
         dist = self._dist_px(pos)          # 控件像素（geo 已按 scale 缩过）
         if self.count() == 0:
             return ADD_TO_END if dist <= geo["extent"] + 12 else None
         if dist <= geo["hole"] * 0.98:
-            return ADD_TO_END
+            return ADD_TO_END if from_lib else None
         sid = self.slot_at(pos)
         if sid is None:
             return None
@@ -4444,26 +4718,34 @@ class WheelPreview(sr.WheelWidget):
         return mime.hasFormat(MIME_LIB) or mime.hasFormat(MIME_SLOT)
 
     def dragEnterEvent(self, e) -> None:  # noqa: N802
-        if self._accepts(e.mimeData()):
+        md = e.mimeData()
+        if self._accepts(md):
+            self._drag_from_lib = md.hasFormat(MIME_LIB)
+            self.update()
             e.acceptProposedAction()
 
     def dragMoveEvent(self, e) -> None:  # noqa: N802
-        if not self._accepts(e.mimeData()):
+        md = e.mimeData()
+        if not self._accepts(md):
             return
-        target = self._target_at(e.position().toPoint())
+        self._drag_from_lib = md.hasFormat(MIME_LIB)
+        target = self._target_at(e.position().toPoint(), self._drag_from_lib)
         if target != self.drop_target:
             self.drop_target = target
             self.update()
         e.acceptProposedAction()
 
     def dragLeaveEvent(self, e) -> None:  # noqa: N802
+        # 只清扇区高亮：拖动还在继续（鼠标可能只是移回左边的音效库），
+        # 中心的提示要留着，那是"这一趟拖拽还活着"的信号。
         self.drop_target = None
         self.update()
 
     def dropEvent(self, e) -> None:  # noqa: N802
         md = e.mimeData()
-        target = self._target_at(e.position().toPoint())
+        target = self._target_at(e.position().toPoint(), md.hasFormat(MIME_LIB))
         self.drop_target = None
+        # 松手后 exec 马上就会返回并调 end_lib_drag()，这里不必自己清 _lib_drag
         self.update()
         if target is None:
             e.ignore()
@@ -4480,7 +4762,11 @@ class WheelPreview(sr.WheelWidget):
     def paintEvent(self, e) -> None:  # noqa: N802
         super().paintEvent(e)
         tgt = self.drop_target
-        if tgt is None or self.bank is None:
+        if self.bank is None:
+            return
+        # 从音效库拖着东西时，中心从头亮到尾 —— 不必等鼠标走到轮盘上
+        hint_on = self._lib_drag and self._drag_from_lib
+        if not hint_on and tgt is None:
             return
 
         geo, _ = self.ring_geometry()
@@ -4490,11 +4776,15 @@ class WheelPreview(sr.WheelWidget):
         p.setBrush(QColor(255, 255, 255, 44))
         p.setPen(QPen(QColor(255, 255, 255, 170), 2.0, Qt.DashLine))
 
-        if tgt == ADD_TO_END:
-            # 中间圆：这是"添加"，不是"替换"。文字交给中心那行提示去写，
-            # 否则会压在音效名上糊成一片
-            r = geo["hole"] * 0.96
+        if hint_on:
+            # 已经在中心 = 全亮；还在某个扇区上 = 半亮，算个"预告"
+            hot = tgt == ADD_TO_END
+            r = geo["hole"] * 0.97
+            p.setBrush(QColor(accent(118 if hot else 58)))
+            p.setPen(QPen(accent_light(250 if hot else 165), 2.6, Qt.DashLine))
             p.drawEllipse(QPointF(cx, cy), r, r)
+
+        if tgt is None or tgt == ADD_TO_END:
             p.end()
             return
 
@@ -5229,8 +5519,15 @@ class SettingsWindow(QWidget):
         # 不把窗口放高一点，右下角那块和轮盘预览会互相挤
         # 840 → 880：v0.9.0 又多了「停止」一行（卡片 246 → 270）
         # 880 → 900：v0.9.1 又多了「打断」一行（卡片 270 → 290）
-        self.resize(1120, 900)
+        # v0.9.2：尺寸改成可缩放并记住（_restore_geometry / resizeEvent）
         self.setMinimumSize(980, 860)
+        self.setMouseTracking(True)
+        # 手动缩放兜底状态（系统不接手时用，见 begin_resize）
+        self._rs_active = False
+        self._rs_edges = Qt.Edges()
+        self._rs_global = QPoint()
+        self._rs_geo: QRect | None = None
+        self._restore_geometry()
         self.setStyleSheet(build_qss())
 
         outer = QVBoxLayout(self)
@@ -5238,6 +5535,9 @@ class SettingsWindow(QWidget):
 
         self.root = QWidget()
         self.root.setObjectName("Root")
+        # 窗口边框那几像素是 root 的空白区（标签页和外边有 20px 内边距），
+        # 不开 tracking 的话鼠标移过去收不到事件，光标不会变成缩放箭头
+        self.root.setMouseTracking(True)
         outer.addWidget(self.root)
 
         v = QVBoxLayout(self.root)
@@ -5257,6 +5557,7 @@ class SettingsWindow(QWidget):
         # ---- 左：标签页 ----
         left = QWidget()
         left.setFixedWidth(470)
+        self.left_panel = left      # 窗口拉宽时跟着变宽（见 _fit_left_panel）
         ll = QVBoxLayout(left)
         ll.setContentsMargins(0, 0, 0, 0)
         ll.setSpacing(8)
@@ -5318,6 +5619,9 @@ class SettingsWindow(QWidget):
         self.preview.lib_dropped.connect(self._on_lib_dropped)
         self.preview.slot_dropped.connect(self._on_slot_dropped)
         self.preview.slot_clicked.connect(self._on_slot_clicked)
+        # 音效库一抓起东西就点亮预览中心，拖完熄灯 —— 不依赖鼠标进没进轮盘
+        self.page_lib.drag_began.connect(self.preview.begin_lib_drag)
+        self.page_lib.drag_ended.connect(self.preview.end_lib_drag)
         wh.addWidget(self.preview, 1, Qt.AlignCenter)
         rl.addWidget(wheel_holder, 1)
 
@@ -5380,6 +5684,226 @@ class SettingsWindow(QWidget):
         super().resizeEvent(e)
         if self._tip is not None:
             self._tip.setGeometry(self.root.geometry())
+        self._fit_left_panel()
+        self._queue_geom_save()
+
+    def moveEvent(self, e) -> None:  # noqa: N802
+        super().moveEvent(e)
+        self._queue_geom_save()
+
+    # ---- 窗口尺寸（v0.9.2：可缩放 + 记住） ----
+    _GEOM_SAVE_MS = 700
+    _EDGE_POLL_MS = 40      # 多久看一眼鼠标在不在窗口边（见 _poll_edge_cursor）
+
+    def _fit_left_panel(self) -> None:
+        """左边标签页跟着窗口变宽：拉大窗口时音效库格子也能变宽，不至于空一片。"""
+        panel = getattr(self, "left_panel", None)
+        if panel is None:
+            return
+        w = max(470, min(760, int(self.width() * 0.42)))
+        if panel.width() != w:
+            panel.setFixedWidth(w)
+
+    def _queue_geom_save(self) -> None:
+        """拖动缩放时别每帧写盘，停手 0.7 秒再存一次。"""
+        if getattr(self, "_geom_timer", None) is None:
+            self._geom_timer = QTimer(self)
+            self._geom_timer.setSingleShot(True)
+            self._geom_timer.setInterval(self._GEOM_SAVE_MS)
+            self._geom_timer.timeout.connect(self._save_geometry)
+        self._geom_timer.start()
+
+    def _save_geometry(self) -> None:
+        if self.isMinimized() or not self.isVisible():
+            return
+        g = self.geometry()
+        self.cfg["settings_geom"] = [g.x(), g.y(), g.width(), g.height()]
+        try:
+            sr.save_config(self.cfg)
+        except Exception:
+            pass
+
+    def _restore_geometry(self) -> None:
+        """还原上次的窗口大小/位置；没存过或存的位置已经不在屏幕上就用默认值。"""
+        from PySide6.QtGui import QGuiApplication
+
+        default_w, default_h = 1120, 900
+        geo = self.cfg.get("settings_geom")
+        if not (isinstance(geo, (list, tuple)) and len(geo) == 4):
+            self.resize(default_w, default_h)
+            return
+        try:
+            x, y, w, h = (int(v) for v in geo)
+        except (TypeError, ValueError):
+            self.resize(default_w, default_h)
+            return
+        w = max(w, 980)
+        h = max(h, 860)
+        # 屏幕可能换了/分辨率变了：整块落到可用区域里，别让用户对着屏幕外的窗口找不到
+        screen = QGuiApplication.screenAt(QPoint(x + w // 2, y + h // 2))
+        if screen is None:
+            screen = QGuiApplication.primaryScreen()
+        if screen is None:
+            self.resize(w, h)
+            return
+        area = screen.availableGeometry()
+        w = min(w, area.width())
+        h = min(h, area.height())
+        x = min(max(x, area.x()), area.x() + area.width() - w)
+        y = min(max(y, area.y()), area.y() + area.height() - h)
+        self.setGeometry(x, y, w, h)
+
+    # ---- 缩放命中：全部走 Qt 层 ----
+    # 曾经试过让窗口接 WM_NCHITTEST 回缩放区域码（指望系统自己当边框）：
+    # 系统一旦把边缘算成"非客户区"，Qt 就不再产生普通鼠标按下事件，
+    # startSystemResize 那条路永远走不到，表现就是"光标不变、按下去也不动"。
+    # 现在整个窗口都是客户区，缩放和光标全自己管，不依赖系统 hit-test。
+
+    def _edges_at(self, pos):
+        """窗口内坐标 -> 缩放边缘；不在边上返回空。"""
+        if self.isMaximized() or self.isFullScreen():
+            return Qt.Edges()
+        b = _RESIZE_BORDER
+        w, h = self.width(), self.height()
+        x, y = pos.x(), pos.y()
+        edges = Qt.Edges()
+        if x <= b:
+            edges |= Qt.LeftEdge
+        elif x >= w - b:
+            edges |= Qt.RightEdge
+        if y <= b:
+            edges |= Qt.TopEdge
+        elif y >= h - b:
+            edges |= Qt.BottomEdge
+        return edges
+
+    def start_resize(self, edges) -> bool:
+        """请系统接管缩放（发 SC_SIZE），起来了返回 True。
+
+        系统缩放最顺滑：跟随 DPI、贴边吸附、松手才落定，都是原生行为。
+        现在整个窗口都是客户区，Qt 的鼠标按下事件照常送到，这一脚补得上。
+        """
+        if not edges:
+            return False
+        wh = self.windowHandle()
+        if wh is None:
+            return False
+        try:
+            return bool(wh.startSystemResize(edges))
+        except Exception:
+            return False
+
+    def begin_resize(self, edges, global_pos) -> bool:
+        """按下边上了：先请系统接管，系统不接就自己算。
+
+        两条路都返回 True（表示"这一下已经处理掉了，别再拿去拖窗口"）。
+        自己算那条是兜底 —— 系统缩放最顺滑（有原生吸附/DPI 处理），
+        但不该出现"某些机器上就是拖不动"这种死路。
+        """
+        if not edges:
+            return False
+        if self.start_resize(edges):
+            return True
+        self._rs_edges = edges
+        self._rs_global = global_pos
+        self._rs_geo = QRect(self.geometry())
+        self._rs_active = True
+        return True
+
+    def _apply_manual_resize(self, global_pos) -> None:
+        if not self._rs_active or self._rs_geo is None:
+            return
+        dx = global_pos.x() - self._rs_global.x()
+        dy = global_pos.y() - self._rs_global.y()
+        g = QRect(self._rs_geo)
+        minw = max(1, self.minimumWidth())
+        minh = max(1, self.minimumHeight())
+        if self._rs_edges & Qt.LeftEdge:
+            # 左边界最多往右推到「右边界 - 最小宽度」（再往右窗口就太窄了）；
+            # 往左拖是放大，没有上限
+            g.setLeft(min(g.left() + dx, g.right() - minw + 1))
+        if self._rs_edges & Qt.RightEdge:
+            g.setRight(max(g.right() + dx, g.left() + minw - 1))
+        if self._rs_edges & Qt.TopEdge:
+            g.setTop(min(g.top() + dy, g.bottom() - minh + 1))
+        if self._rs_edges & Qt.BottomEdge:
+            g.setBottom(max(g.bottom() + dy, g.top() + minh - 1))
+        self.setGeometry(g)
+
+    def mousePressEvent(self, e) -> None:  # noqa: N802
+        if e.button() == Qt.LeftButton:
+            edges = self._edges_at(e.position().toPoint())
+            if edges and self.begin_resize(edges, e.globalPosition().toPoint()):
+                e.accept()
+                return
+        super().mousePressEvent(e)
+
+    def _set_edge_cursor(self, edges) -> None:
+        """按当前贴着哪条边换光标；每帧都设会一直触发属性变更，所以只在变时动。"""
+        cur = _cursor_for_edges(edges)
+        if cur != getattr(self, "_resize_cursor", "unset"):
+            self._resize_cursor = cur
+            if cur is None:
+                self.unsetCursor()
+            else:
+                self.setCursor(cur)
+
+    def _edge_watch_start(self) -> None:
+        if getattr(self, "_edge_timer", None) is None:
+            self._edge_timer = QTimer(self)
+            self._edge_timer.setInterval(self._EDGE_POLL_MS)
+            self._edge_timer.timeout.connect(self._poll_edge_cursor)
+        self._edge_timer.start()
+
+    def _poll_edge_cursor(self) -> None:
+        """定时看一眼鼠标在不在窗口边。
+
+        为什么不靠鼠标事件：鼠标"跳"到边上时（快速移动、从别的窗口直接移过来）
+        系统只发 Enter 不发 Move，靠事件驱动必然漏掉，光标就不变。
+        40ms 看一眼的开销可以忽略，胜在绝不会漏。
+        """
+        if self._rs_active or not self.isVisible():
+            return
+        try:
+            pt = ctypes.wintypes.POINT()
+            ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+            under = ctypes.windll.user32.WindowFromPoint(pt)
+            hwnd = int(self.winId())
+            inside = int(under or 0) == hwnd or bool(
+                ctypes.windll.user32.IsChild(
+                    ctypes.wintypes.HWND(hwnd), ctypes.wintypes.HWND(under)
+                )
+            )
+        except Exception:
+            return
+        if not inside:
+            self._set_edge_cursor(Qt.Edges())
+            return
+        self._set_edge_cursor(self._edges_at(self.mapFromGlobal(QCursor.pos())))
+
+    def mouseMoveEvent(self, e) -> None:  # noqa: N802
+        if self._rs_active and e.buttons() & Qt.LeftButton:
+            self._apply_manual_resize(e.globalPosition().toPoint())
+            return
+        self._set_edge_cursor(self._edges_at(e.position().toPoint()))
+        super().mouseMoveEvent(e)
+
+    def hideEvent(self, e) -> None:  # noqa: N802
+        if getattr(self, "_edge_timer", None) is not None:
+            self._edge_timer.stop()
+        super().hideEvent(e)
+
+    def mouseReleaseEvent(self, e) -> None:  # noqa: N802
+        if self._rs_active:
+            self._rs_active = False
+            self._rs_geo = None
+            self._queue_geom_save()
+        super().mouseReleaseEvent(e)
+
+    def leaveEvent(self, e) -> None:  # noqa: N802
+        self._resize_cursor = None
+        self.unsetCursor()
+        super().leaveEvent(e)
 
     # ---- 拖放与增删 ----
     def _apply(self) -> None:
@@ -5615,6 +6139,7 @@ class SettingsWindow(QWidget):
 
     def showEvent(self, e) -> None:  # noqa: N802
         super().showEvent(e)
+        self._edge_watch_start()
         # 每次打开都重新扫一遍：用户可能刚在文件夹里放了/删了文件
         self.bank.reload()
         self._sync_preview_color()
@@ -5628,5 +6153,8 @@ class SettingsWindow(QWidget):
         # 引导卡还开着就一起收掉，顺便把「看过」记下来，下次打开别再打扰
         if self._tip is not None:
             self._close_help_tip()
+        self._save_geometry()      # 刚拖完就关窗口的话，别等那个延时定时器
+        if getattr(self, "_geom_timer", None) is not None:
+            self._geom_timer.stop()
         self.hide()
         self.closed.emit()

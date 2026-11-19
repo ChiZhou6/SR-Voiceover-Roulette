@@ -1,4 +1,8 @@
-"""确认：删掉的音效 / 下盘的音效不会被自动补回来。"""
+"""确认"文件消失/回来/自己下盘"这三种情况各走哪条路。
+
+v0.9.2 改了行为：文件不见了不再直接抹掉参数，而是记进暂存区；
+文件放回来会自动接回原来的位置。手动下盘（remove）仍然不会自己回来。
+"""
 import sys
 import tempfile
 from pathlib import Path
@@ -25,6 +29,7 @@ with tempfile.TemporaryDirectory() as td:
     cfg = SoundsConfig(p)
     cfg.load()
     check(cfg.sync(disk) == disk, "首次运行：磁盘文件全部上盘")
+    cfg.setting("b.wav").volume = 0.4
     cfg.save()
 
     # 删掉一个文件（模拟用户在资源管理器里删除）
@@ -32,20 +37,28 @@ with tempfile.TemporaryDirectory() as td:
     cfg2.load()
     left = cfg2.sync(["a.wav", "c.wav"])
     check(left == ["a.wav", "c.wav"], "删掉文件后：轮盘只剩剩下的两个", str(left))
+    check("b.wav" in cfg2.parked.get(cfg2.wheels[0].wid, {}), "被删的那个进了暂存区")
     cfg2.save()
 
-    # 重启后再同步：绝不能把 b.wav 补回来
+    # 重启、文件仍然不在：不会自己冒出来，但参数还留着
     cfg3 = SoundsConfig(p)
     cfg3.load()
-    check(cfg3.sync(disk) == ["a.wav", "c.wav"],
-          "重启后：被删的音效不会自动补回来", str(cfg3.order))
+    check(cfg3.sync(["a.wav", "c.wav"]) == ["a.wav", "c.wav"],
+          "文件一直不在：轮盘上就没有它", str(cfg3.order))
+    check("b.wav" in cfg3.parked.get(cfg3.wheels[0].wid, {}), "参数仍然留着")
 
-    # 手动下盘（文件还在）
+    # 文件放回来了（换了个地方找回来 / 从回收站还原）：自动接回原位，参数照旧
+    check(cfg3.sync(disk) == ["a.wav", "b.wav", "c.wav"],
+          "文件放回来：自动接回原来的位置", str(cfg3.order))
+    check(abs(cfg3.setting("b.wav").volume - 0.4) < 1e-6, "参数跟着回来了",
+          str(cfg3.setting("b.wav").volume))
+
+    # 手动下盘（文件还在）：这个不会自己回来 —— 用户是故意的
     cfg3.remove("a.wav")
     cfg3.save()
     cfg4 = SoundsConfig(p)
     cfg4.load()
-    check(cfg4.sync(disk) == ["c.wav"], "下盘的音效不会被补回", str(cfg4.order))
+    check(cfg4.sync(disk) == ["b.wav", "c.wav"], "手动下盘的音效不会被补回", str(cfg4.order))
 
     # 新放进来的文件：也不会自动上盘
     check("d.wav" not in cfg4.sync(disk + ["d.wav"]),

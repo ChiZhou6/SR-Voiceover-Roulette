@@ -13,12 +13,32 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import re
+import shutil
+import time
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 CONFIG_VERSION = 4
+
+# 日志出口由主程序注入（这个模块单独测试时不依赖 sr_roulette）
+_log_hook = None
+
+
+def set_logger(fn) -> None:
+    global _log_hook
+    _log_hook = fn
+
+
+def _log(msg: str) -> None:
+    if _log_hook is None:
+        return
+    try:
+        _log_hook(msg)
+    except Exception:
+        pass
 
 # 最多能存几套轮盘（含当前正在用的那套）
 MAX_WHEELS = 8
@@ -476,6 +496,16 @@ class SoundsConfig:
         # 组合音效：cid -> ComboDef。全套轮盘共用（它们是"音效"，不是"摆位"）。
         # 轮盘上以 "combo::cid" 的形式占一个槽位
         self.combos: dict[str, ComboDef] = {}
+        # 文件暂时不见了的音效：wid -> {key: {setting, index, since}}。
+        # 参数放在这里而不是直接删掉 —— 用户把文件挪走几天再放回来，
+        # 音量/变调/快捷键这些都还在（v0.9.2 之前是直接删，删了就真没了）。
+        self.parked: dict[str, dict[str, dict]] = {}
+        # 这次读盘/校正有没有改动过内容：没改就不用写盘，少写一次就少一次写坏的机会
+        self.dirty = False
+        # 主文件坏了、从 .bak 救回来的
+        self.restored_from_backup = False
+        # 这次扫描一个音效都没扫到（但配置里明明有）——多半是目录暂时读不到
+        self.scan_suspicious = False
         # 是否已经有配置文件：决定 sync 时要不要把磁盘上的文件全数上盘。
         # 只在"第一次运行"这么做，之后轮盘只放用户自己挑的。
         self._initialized = path.exists()
@@ -524,26 +554,47 @@ class SoundsConfig:
 
     # ---- 读写 ----
     def load(self) -> None:
+        self._reset()
+        if not self.path.exists():
+            self._initialized = False
+            return
+        if self._load_one(self.path):
+            self._initialized = True
+            return
+        # 主文件读不出来（写到一半断电/被杀、磁盘出错、手改坏了）：
+        # 先退回上一次的备份。备份在每次成功写盘前留，所以它离"最后一刻"只差一步。
+        bak = self._backup_path()
+        if bak.exists() and self._load_one(bak):
+            self._initialized = True
+            self.restored_from_backup = True
+            self.dirty = True
+            _log(f"[config] {self.path.name} 读不出来，已从备份 {bak.name} 恢复")
+            return
+        # 两处都不行：当"没配置"处理，sync 会把磁盘上的音效全数上盘，
+        # 总比轮盘空空如也、用户以为程序坏了要好
+        self._initialized = False
+
+    def _reset(self) -> None:
         self.wheels = [WheelDef(wid="w1", name="轮盘 1")]
         self._cur = "w1"
         self.order = []
         self.outer_slots = [None] * OUTER_MAX
         self.items = {}
         self.combos = {}
-        if not self.path.exists():
-            self._initialized = False
-            return
-        self._initialized = True
+        self.parked = {}
+        self.scan_suspicious = False
+
+    def _backup_path(self) -> Path:
+        return self.path.with_name(self.path.name + ".bak")
+
+    def _load_one(self, path: Path) -> bool:
+        """读一份配置。返回是否读成功（结构不对也算失败，交给上层回退备份）。"""
         try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
-            # 文件坏了就当没有：sync 会把磁盘上的音效全数上盘，
-            # 总比轮盘空空如也、用户以为程序坏了要好
-            self._initialized = False
-            return
+            return False
         if not isinstance(data, dict):
-            self._initialized = False
-            return
+            return False
 
         def read_items(raw) -> dict[str, SoundSetting]:
             out: dict[str, SoundSetting] = {}
@@ -620,7 +671,18 @@ class SoundsConfig:
                     continue
                 if c.cid and c.cid not in self.combos:
                     self.combos[c.cid] = c
+
+        # 暂缺音效的参数（v0.9.2）：文件回来时按这里恢复
+        raw_parked = data.get("parked")
+        self.parked = {}
+        if isinstance(raw_parked, dict):
+            for wid, box in raw_parked.items():
+                if isinstance(box, dict):
+                    self.parked[str(wid)] = {
+                        str(k): v for k, v in box.items() if isinstance(v, dict)
+                    }
         self.normalize_outer()
+        return True
 
     def save(self) -> None:
         for w in self.wheels:
@@ -635,6 +697,8 @@ class SoundsConfig:
             "order": cur.order,
             "outer_slots": cur.outer_slots,
             "items": {k: asdict(v) for k, v in cur.items.items()},
+            # 文件暂时不在的音效：参数留着，文件回来就自动恢复
+            "parked": {wid: box for wid, box in self.parked.items() if box},
             "combos": [
                 {
                     "cid": c.cid, "name": c.name, "mode": c.mode,
@@ -647,12 +711,26 @@ class SoundsConfig:
                 for c in self.combos.values()
             ],
         }
+        blob = json.dumps(payload, ensure_ascii=False, indent=2)
+        # 先写临时文件再原子替换：写一半被杀/断电，磁盘上留下的仍是上一版完整配置，
+        # 而不是一个被截断的、下次启动读不出来的半截 JSON（v0.9.2 之前就是这样丢的）。
+        tmp = self.path.with_name(self.path.name + ".new")
         try:
-            self.path.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-        except Exception:
-            pass
+            tmp.write_text(blob, encoding="utf-8")
+        except Exception as exc:
+            _log(f"[config] 写临时配置失败: {exc}")
+            return
+        try:
+            if self.path.exists():
+                shutil.copy2(self.path, self._backup_path())
+            os.replace(tmp, self.path)
+            self.dirty = False
+        except Exception as exc:
+            _log(f"[config] 保存 sounds.json 失败: {exc}")
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
     # ---- 轮盘管理 ----
     def wheel_by_id(self, wid: str) -> WheelDef | None:
@@ -747,6 +825,18 @@ class SoundsConfig:
         alive = set(names)
         prev_order = list(self.order)
 
+        # 一个都没扫到、配置里却明明有：九成是目录这会儿读不到
+        # （网盘还没挂上、杀软锁着、盘符没就绪、用户正好在改文件夹名）。
+        # 这种时候绝不能当"用户把音效删光了"处理：老版本会立刻清空 order 并写盘，
+        # 之后文件回来了也不会自动上盘 —— 表现出来就是"一段时间没用，音效全没了"。
+        if not names and prev_order:
+            self.scan_suspicious = True
+            _log(f"[sound] 这次一个音效都没扫到，配置里却有 {len(prev_order)} 个，"
+                 "按扫描异常处理，不动配置")
+            return list(self.order)
+
+        prev_index = {k: i for i, k in enumerate(prev_order)}
+
         def _live_combo(key: str) -> bool:
             """组合键是否还指向一个存在的组合（组合删了就该从轮盘上消失）。"""
             return is_combo_key(key) and key[len(COMBO_PREFIX):] in self.combos
@@ -756,7 +846,12 @@ class SoundsConfig:
         if not self._initialized:
             final = list(names)
             self._initialized = True
+            self.dirty = True
         else:
+            # 上次"文件暂时不在"的音效如果回来了，先接回原位再算，
+            # 否则它们会在下面这一轮清理里被当成不存在
+            self._unpark(self.cur_wheel(), alive)
+
             exact = [n for n in self.order if n in alive or _live_combo(n)]
             olds = [n for n in self.order if n not in alive and not _live_combo(n)]
             news = [n for n in names if n not in exact]
@@ -802,25 +897,84 @@ class SoundsConfig:
             if full and full not in self.items:
                 self.items[full] = self.items.pop(k)
 
-        # 清理已消失文件的参数。组合键（combo::xxx）单独留着：
-        # 它们的参数（音量/快捷键）跟着组合定义一起由 delete_combo 收拾
-        for dead in [k for k in self.items if k not in alive and not is_combo_key(k)]:
-            self.items.pop(dead, None)
+        # 清理已消失文件的参数 —— 但**不是删掉**，是搬到暂存区（parked）。
+        # 用户把文件挪走几天再放回来，音量/变调/快捷键/条件都还在。
+        # 组合键（combo::xxx）不参与：它们的参数跟着组合定义走。
+        # 没改过参数的音效也要记一笔位置，否则文件回来只能排到队尾。
+        cur = self.cur_wheel()
+        for dead in self._missing_keys(cur.items, prev_order, alive):
+            self._park_dead(cur, dead, prev_index.get(dead, -1))
 
         self.order = final
+        if final != prev_order:
+            self.dirty = True
         self.normalize_outer()
 
         # 其他几套轮盘也要跟着收拾：文件被删/改名后，切过去不该出现空槽位。
         # 只做"减"，不自动补新文件（那是首次运行才有的待遇）。
-        cur = self.cur_wheel()
         for w in self.wheels:
             if w is cur:
                 continue
+            self._unpark(w, alive)      # 先接回文件又回来的
+            w_prev = {k: i for i, k in enumerate(w.order)}
             w.order = [n for n in w.order if n in alive or _live_combo(n)]
-            for dead in [k for k in w.items if k not in alive and not is_combo_key(k)]:
-                w.items.pop(dead, None)
+            for dead in self._missing_keys(w.items, list(w_prev), alive):
+                self._park_dead(w, dead, w_prev.get(dead, -1))
             self.normalize_outer(w)
         return list(final)
+
+    @staticmethod
+    def _missing_keys(items: dict, order: list[str], alive: set[str]) -> list[str]:
+        """这次没找到文件的 key：参数表里有、或者轮盘上摆着的，都要记进暂存区。"""
+        out: list[str] = []
+        for k in items:
+            if k not in alive and not is_combo_key(k):
+                out.append(k)
+        for k in order:
+            if k not in alive and not is_combo_key(k) and k not in out:
+                out.append(k)
+        return out
+
+    def _park_dead(self, wheel: WheelDef, key: str, index: int = -1) -> None:
+        """文件不见了：参数搬进暂存区（不是删掉），文件回来还能原样接上。"""
+        if is_combo_key(key):
+            return
+        st = wheel.items.pop(key, None)
+        if st is None and key not in wheel.order:
+            return
+        box = self.parked.setdefault(wheel.wid, {})
+        box[key] = {
+            "since": int(time.time()),
+            "index": int(index),
+            "setting": asdict(st) if st is not None else None,
+        }
+        self.dirty = True
+
+    def _unpark(self, wheel: WheelDef, alive: set[str]) -> None:
+        """暂存区里那些文件又出现了：参数放回去，位置也尽量放回原处。"""
+        box = self.parked.get(wheel.wid)
+        if not box:
+            return
+        for key in list(box):
+            if key not in alive:
+                continue
+            info = box.pop(key)
+            raw = info.get("setting")
+            if isinstance(raw, dict) and key not in wheel.items:
+                try:
+                    kwargs = {k: v for k, v in raw.items() if k in _DEFAULT_KEYS}
+                    wheel.items[key] = SoundSetting(**kwargs).clamped()
+                except Exception:
+                    wheel.items[key] = SoundSetting()
+            if key not in wheel.order:
+                idx = int(info.get("index", -1) or -1)
+                if 0 <= idx <= len(wheel.order):
+                    wheel.order.insert(idx, key)
+                else:
+                    wheel.order.append(key)
+            self.dirty = True
+        if not box:
+            self.parked.pop(wheel.wid, None)
 
     @staticmethod
     def _match_renamed(olds: list[str], news: list[str]) -> dict[str, str]:
