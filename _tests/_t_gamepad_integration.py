@@ -175,7 +175,7 @@ class GamepadIntegrationTests(unittest.TestCase):
         self.tick(0)
         self.assertEqual(self.audio.names, ["release.wav"])
 
-    def test_saved_global_binding_follows_wheel_and_yields_to_reserved_key(self):
+    def test_saved_global_binding_follows_wheel_and_ignores_retired_repeat_key(self):
         self.bind("global.wav", "pad_a").global_hotkey = True
         self.bind("local.wav", "pad_a")
         alternate = self.scfg.new_wheel(copy_current=False)
@@ -189,11 +189,13 @@ class GamepadIntegrationTests(unittest.TestCase):
         self.tick(PAD_A)
         self.assertEqual(self.audio.names, ["global.wav"])
         self.tick(0)
+        # v0.9.3 删掉了「重复上一个」全局键：老配置里残留的 repeat_last_key
+        # 不再抢注，再按一次靠的是音效自己的全局热键重放。
         self.cfg["repeat_last_key"] = "pad_a"
         self.poller.rebuild_bindings()
         self.tick(PAD_A)
-        self.assertEqual(self.audio.names, ["global.wav"])
-        self.assertEqual(self.audio.repeated, 1)
+        self.assertEqual(self.audio.names, ["global.wav", "global.wav"])
+        self.assertEqual(self.audio.repeated, 0)
 
     def test_focused_capture_saves_and_clears_without_capturing_in_background(self):
         sound = "record.wav"

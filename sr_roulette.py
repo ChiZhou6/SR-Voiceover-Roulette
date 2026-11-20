@@ -160,7 +160,7 @@ import theme
 from theme import accent, accent_dark, accent_light, set_accent
 
 APP_NAME = "SR Voiceover Roulette"
-APP_VERSION = "v0.9.2"
+APP_VERSION = "v0.9.3"
 
 DEBUG = os.environ.get("SR_DEBUG") == "1"
 
@@ -926,15 +926,27 @@ DEFAULT_CONFIG = {
     "poll_ms": 8,
     "fade_ms": 6,
     "audio_buffer_ms": 60,
+    # ---- 停止 / 暂停时的淡出（v0.9.3）----
+    # 关着是原来的行为：12ms 的淡出，人耳听不出来，只是防爆音。
+    # 开着就按下面的时长慢慢变小，听起来像"余音收掉"，不像"啪一下没了"。
+    "stop_fade_enabled": False,
+    "stop_fade_ms": 400,
     # ---- 快捷动作：空字符串表示不绑定 ----
-    "repeat_last_key": "",   # 重复播放上一个音效
+    # v0.9.3 起「重复上一个」不再有独立按键：单击呼出键就是放这套盘上次那个。
+    # 字段留着只为读老配置时不报错，程序不再读它。
+    "repeat_last_key": "",
     "cycle_key": "",         # 按槽位顺序播放下一个
     # 呼出"切换轮盘的轮盘"的键：按住弹出、划到哪套松手就切到哪套。
     # 默认不绑定——多一个键就多一份和游戏键位打架的风险，谁需要谁自己开。
     "switch_key": "",
-    # 轻按（没长到弹轮盘）时做什么：none / repeat_last / next
-    # 默认 repeat_last：单击热键重播上一个音效，长按才弹轮盘
-    "tap_action": "repeat_last",
+    # 轻按（没长到弹轮盘）时做什么：auto / none / next
+    # auto = 播放「这套盘选中的、或上次响过的」那个。
+    # v0.9.3 把原来的 repeat_last 并进来了：单击呼出键本来就该放这个，
+    # 单独再留一个"重复上一个"选项只是把人绕进去。
+    "tap_action": "auto",
+    # 预选模式（v0.9.3）：长按弹盘后松手只「选中」不出声，
+    # 再单击一次呼出键才播放选中的那个。适合先瞄好、等需要时再按。
+    "preselect_mode": False,
     # ---- 外观 ----
     # 应用主题色：托盘图标、设置界面的高亮/滑块/选中态。任意色值，不是只有四个预设。
     # 轮盘本身的颜色不在这里，它跟着每套轮盘走（见 sounds.json 的 wheels[].color）
@@ -1302,6 +1314,23 @@ def _same_fmt(a: QAudioFormat, b: QAudioFormat) -> bool:
     )
 
 
+# Qt 的 QAudio.Error 名字翻译成人话。
+# 用户看到"OpenError"只会以为软件坏了，实际上八成是 Windows 麦克风隐私权限
+# 没开、或者设备被别的程序独占——这两种都跟本程序没关系。
+_CAPTURE_ERR_HINT = {
+    "OpenError": "系统不让打开（检查 设置→隐私和安全性→麦克风 里「允许桌面应用访问麦克风」，"
+                 "并关掉其他正在用麦克风的软件）",
+    "IOError": "设备读写出错（驱动或线缆）",
+    "FatalError": "设备报致命错误（驱动崩了或设备被拔掉）",
+    "TimeoutError": "设备无响应",
+}
+
+
+def _capture_err_text(err_name: str) -> str:
+    """QAudio.Error 名字 -> 一句能照着查的话。"""
+    return _CAPTURE_ERR_HINT.get(str(err_name), str(err_name))
+
+
 def _fmt_label(fmt: QAudioFormat) -> str:
     """把格式写成一句人话，报错时用：48k立体声/浮点。"""
     sf = {
@@ -1365,6 +1394,11 @@ def capture_formats(dev) -> list:
     有些虚拟声卡、蓝牙耳麦、共享模式下的设备会满口答应"48k 立体声没问题"，
     真去 start() 却直接拒绝。以前一台设备只试一两种就整台放弃，
     明明 16k 单声道能出声也用不上，用户看到的就是"麦克风打不开、注入不了"。
+
+    **反过来也一样**：Win11 24H2/25H2 上见过设备把整条梯子全报成"不支持"，
+    一个候选都不给，于是这台设备连试都没试就被跳过（用户看到"没有可用格式"）。
+    所以报告为空时，照样挑几个最有代表性的真去开一次 —— 报错不可信，
+    真 start() 才算数，失败也就多花几十毫秒。
     """
     out: list = []
     if dev is None:
@@ -1383,16 +1417,23 @@ def capture_formats(dev) -> list:
         except Exception:
             continue
 
-    # 兜底：一条梯子都不认时，才拿设备自报的首选格式碰碰运气
-    # （有些专业声卡只认自己那一个古怪组合）。
-    # 不能无条件追加：老实的设备已经报准了格式，再塞一个它没答应过的纯属瞎试。
     if not out:
+        # 设备一个都不报支持：先信它自报的首选格式（那是它的默认配置，最可能开得起来），
+        # 再按"最可能出声"的几种真去试 —— 报错不可信，真 start() 才算数。
         try:
             pf = dev.preferredFormat()
             if pf.sampleRate() > 0 and pf.channelCount() > 0:
-                out.append(_fmt(pf.sampleRate(), pf.channelCount(), pf.sampleFormat()))
+                push(_fmt(pf.sampleRate(), pf.channelCount(), pf.sampleFormat()))
         except Exception:
             pass
+        for rate, ch, sf in (
+            (48000, 2, QAudioFormat.Float),
+            (48000, 1, QAudioFormat.Float),
+            (48000, 1, QAudioFormat.Int16),
+            (44100, 1, QAudioFormat.Int16),
+            (16000, 1, QAudioFormat.Int16),
+        ):
+            push(_fmt(rate, ch, sf))
     return out
 
 
@@ -2361,6 +2402,11 @@ class AudioEngine(QObject):
         self._warm_queue: list = []
         self._warm_timer: QTimer | None = None
         self.last_idx: int | None = None   # 供"重复上一个"使用
+        # 每套轮盘各记一份"最后放的是哪个音效"（键 = 轮盘 id，值 = 音效键）。
+        # 记的是音效键而不是槽位号：槽位号只在当前这套盘里有意义，
+        # 切到别的盘再切回来，同一个编号早就指到另一个音效上了。
+        self.last_by_wheel: dict[str, str] = {}
+        self.last_key = ""                 # 最后放的那个音效键（跨盘通用）
         self._cycle = -1                   # 供"顺序播放"使用
         # 每一次"按下触发"的编号：长按触发松手时按这个编号整次掐掉。
         # 从 1 开始，0 留给"不参与按次停止"的普通点击触发。
@@ -2509,7 +2555,7 @@ class AudioEngine(QObject):
             except Exception:
                 pass
             src.deleteLater()
-            return None, "被占用" if err_name == "NoError" else f"打不开（{err_name}）"
+            return None, "被占用" if err_name == "NoError" else f"打不开（{_capture_err_text(err_name)}）"
         return (cap, src, io), ""
 
     def _start_capture(self) -> None:
@@ -2564,6 +2610,18 @@ class AudioEngine(QObject):
         self.mic_error = "麦克风打不开：" + "；".join(fails[:2])
         self.mic_note = ""
         _log("[mic] " + self.mic_error + (f"（共试了 {len(fails)} 台设备）" if fails else ""))
+        # 诊断用：把所有输入设备连同它自报的首选格式写一行。
+        # 用户发日志过来时，这一行能直接看出"是没枚举到设备"还是"设备在但要不开"。
+        try:
+            listing = " | ".join(
+                f"{d.description()}"
+                f"({d.preferredFormat().sampleRate()}Hz/{d.preferredFormat().channelCount()}ch/"
+                f"{d.preferredFormat().sampleFormat().name})"
+                for d in all_inputs()
+            )
+            _log(f"[mic] 系统输入设备：{listing or '（一台都没有）'}")
+        except Exception as exc:
+            _log(f"[mic] 枚举输入设备失败: {exc}")
 
     def _install_capture(self, dev, fmt: QAudioFormat, cap: MicCapture, src, io) -> None:
         """把开好的采集接上定时泵。"""
@@ -2858,7 +2916,7 @@ class AudioEngine(QObject):
         if isinstance(entry, ComboEntry):
             ok = self.play_combo(entry.cdef, token=token, slot=idx)
             if ok:
-                self.last_idx = idx
+                self._remember_last(idx)
             return ok
 
         clip = self.clips[idx]
@@ -2923,12 +2981,32 @@ class AudioEngine(QObject):
 
         if DEBUG and (abs(semitones) >= 0.05 or abs(speed) >= 0.01):
             _log(f"[play] {idx} 变调 {semitones:+.1f} 半音 / 速度 {speed * 100:+.0f}%")
-        self.last_idx = idx
+        self._remember_last(idx)
         # 每个出口都要触发一次（波形是同一个，进度各走各的）
         ok = False
         for mix in self._active_mixers():
             ok = mix.trigger(clip, gain, token=token, slot=idx) or ok
         return ok
+
+    def _remember_last(self, idx: int) -> None:
+        """记下"这套轮盘最后放的是哪个音效"。
+
+        既记槽位号（老逻辑还在用），也记音效键 + 轮盘 id。
+        后者才是"切到别的盘、再按这个盘的键"能放对东西的关键 ——
+        槽位号跨盘是错位的。
+        """
+        self.last_idx = idx
+        key = ""
+        try:
+            key = self.bank.full_at(idx)
+        except Exception:
+            key = ""
+        if not key:
+            return
+        self.last_key = key
+        scfg = getattr(self.bank, "scfg", None)
+        wid = str(getattr(scfg, "current", "") or "") if scfg is not None else ""
+        self.last_by_wheel[wid] = key
 
     # ---- 组合播放 ----
     @staticmethod
@@ -3234,11 +3312,27 @@ class AudioEngine(QObject):
             return False, f"写入失败：{exc}"
         return True, f"已导出：{Path(path).name}（{len(data) / float(rate):.2f} 秒）"
 
+    def last_key_of_current(self) -> str:
+        """当前这套轮盘最后放过的音效键（没放过就是空串）。"""
+        scfg = getattr(self.bank, "scfg", None)
+        wid = str(getattr(scfg, "current", "") or "") if scfg is not None else ""
+        return self.last_by_wheel.get(wid, "")
+
     def play_repeat_last(self, token: int = 0) -> bool:
-        """重复播放上一次的音效。"""
-        if self.last_idx is None:
-            return False
-        return self.play(self.last_idx, token=token)
+        """再放一次**这套轮盘**上次响的那个音效。
+
+        v0.9.3 起按轮盘分开记：从别的盘切过来按一下，放的是这套盘自己上次那个，
+        而不是"上一套盘第 3 格"这种张冠李戴。
+
+        这套盘一次都没放过时，放第一个格子 —— 按一下总有声音，
+        比"按了没反应"容易判断得多。
+        """
+        key = self.last_key_of_current()
+        if key and self.play_named(key, token=token):
+            return True
+        if len(self.bank):
+            return self.play(0, token=token)
+        return False
 
     def play_next(self, token: int = 0) -> bool:
         """按槽位顺序播放下一个，到末尾回到开头。"""
@@ -3312,9 +3406,19 @@ class AudioEngine(QObject):
         self._speed_now.clear()
 
     def stop_all(self) -> None:
-        """把正在响的声音立刻掐掉（中空区域松手时用）。两个出口都要掐。"""
+        """把正在响的声音掐掉（中空区域松手时用）。两个出口都要掐。
+
+        默认是 12ms 的"防爆音淡出"——人耳听不出来，只是不让扬声器蹦出咔嚓声。
+        开了「停止淡出」之后按用户设的时长慢慢收尾，听起来是余音散掉，不是硬切。
+        """
+        fade = 12.0
+        if bool(self.cfg.get("stop_fade_enabled", False)):
+            try:
+                fade = max(0.0, min(5000.0, float(self.cfg.get("stop_fade_ms", 400))))
+            except Exception:
+                fade = 400.0
         for mix in self._mixers_all():
-            mix.stop_all()
+            mix.stop_all(fade)
 
     # ---- 按次停止（v0.9：长按触发松手就停）----
     def new_token(self) -> int:
@@ -4806,6 +4910,14 @@ class InputPoller(QObject):
         self.on_switch_wheel: object = None
         self.hotkey_name = norm_spec(cfg["hotkey"]) or "y"
         self.vk = vk_of(self.hotkey_name)
+        # ---- 每套轮盘的专属呼出键（v0.9.3）----
+        # 按下盘键时临时把 hotkey_name 借给它，松手再交还主热键。
+        # 借用的意义是"长按弹盘 / 松手播放 / 单击动作"整套逻辑只写一份：
+        # 另起一套的话，两边迟早走偏（"重复上一个"当初就是这么和呼出分家的）。
+        self._base_hotkey = self.hotkey_name
+        self._borrowed_wid = ""      # 正在借用的轮盘 id（空 = 没借）
+        self._borrowed_key = ""      # 正在借用的那个键
+        self._wh_prev: dict[str, bool] = {}   # 盘键上一帧是否按着
         self._prev = False
         self._press_at = 0.0
         self._held_to_wheel = False   # 这次按住有没有弹出过轮盘（区分长按/轻按）
@@ -4844,16 +4956,70 @@ class InputPoller(QObject):
         self.user_paused = False
         # 暂停状态变了通知外面（主程序用它播暂停/恢复动画）
         self.on_pause_changed: object = None
+        # 预选模式选中的那一格：(轮盘 id, 音效键)；单击呼出键时才真放。
+        # 存轮盘 id 是为了"选中之后又切了盘"时能识别出这一格已经不作数了。
+        self._pending: tuple[str, str] | None = None
+        # 预选/播放状态变了通知外面（主程序用它闪提示条）
+        self.on_pending_changed: object = None
         self.rebuild_bindings()
 
     def run_tap_action(self) -> bool:
-        """轻按热键时执行的动作（长按才是弹轮盘）。"""
-        action = str(self.cfg.get("tap_action", "none") or "none").lower()
-        if action == "repeat_last":
+        """轻按热键时执行的动作（长按才是弹轮盘）。
+
+        预选模式下这一下是"确认播放"：上一次只选中、没出声，
+        现在把它放出来。没有待播的就退回下面那套普通动作。
+        """
+        if self._pending is not None:
+            wid, key = self._pending
+            self._pending = None
+            self._notify_pending()
+            scfg = self._scfg()
+            cur = str(getattr(scfg, "current", "") or "") if scfg is not None else ""
+            # 存的时候记了是哪套盘的：这期间要是切了盘，那格就不作数了
+            if key and wid == cur and self.audio.play_named(key):
+                return True
+
+        action = str(self.cfg.get("tap_action", "auto") or "auto").lower()
+        if action == "repeat_last":        # 老配置的写法，并进 auto 了
+            action = "auto"
+        if action == "auto":
             return self.audio.play_repeat_last()
         if action == "next":
             return self.audio.play_next()
         return False
+
+    # ---- 预选模式 ----
+
+    def _preselect(self) -> bool:
+        return bool(self.cfg.get("preselect_mode", False))
+
+    def _remember_pending(self, idx: int) -> None:
+        """预选模式：把选中的那格记下来，先不出声。"""
+        key = ""
+        try:
+            key = self.audio.bank.full_at(idx)
+        except Exception:
+            key = ""
+        if not key:
+            self._pending = None
+            self._notify_pending()
+            return
+        scfg = self._scfg()
+        wid = str(getattr(scfg, "current", "") or "") if scfg is not None else ""
+        self._pending = (wid, key)
+        self._notify_pending(idx)
+
+    def _notify_pending(self, idx: int | None = None) -> None:
+        """告诉外面"选中了哪个"，主程序拿它闪一条提示条。
+
+        没有这条反馈，用户松手后一片安静，只会以为软件卡了。
+        """
+        if not callable(self.on_pending_changed):
+            return
+        try:
+            self.on_pending_changed(self._pending, idx)
+        except Exception as exc:
+            _log(f"[wheel] 预选提示失败: {exc}")
 
     def set_user_pause(self, on: bool) -> None:
         """进入/退出用户暂停。
@@ -4915,8 +5081,87 @@ class InputPoller(QObject):
         """换呼出键。键盘、鼠标、组合键都支持。"""
         self.hotkey_name = norm_spec(name) or "y"
         self.vk = vk_of(self.hotkey_name)
+        # 主热键换了：借用状态一起作废，免得还指着一个已经不存在的键
+        self._base_hotkey = self.hotkey_name
+        self._borrowed_wid = ""
+        self._borrowed_key = ""
         self._prev = self._down(self.hotkey_name)
         self._press_at = time.monotonic()
+
+    # ---- 每套轮盘的专属呼出键（v0.9.3）----
+
+    def _scfg(self):
+        """当前的 sounds 配置对象。
+
+        单独包一层是因为测试里的假引擎不一定带 bank/scfg ——
+        按键轮询每 8ms 跑一次，这里抛异常等于整个热键链路停摆。
+        """
+        bank = getattr(self.audio, "bank", None)
+        return getattr(bank, "scfg", None) if bank is not None else None
+
+    def _wheel_hotkey_pairs(self) -> list[tuple[str, str]]:
+        """[(轮盘 id, 它的呼出键), ...]，只留真的配了键的。"""
+        scfg = self._scfg()
+        wheels = getattr(scfg, "wheels", None) if scfg is not None else None
+        out: list[tuple[str, str]] = []
+        for w in wheels or []:
+            k = norm_spec(getattr(w, "hotkey", "") or "")
+            if k:
+                out.append((str(getattr(w, "wid", "") or ""), k))
+        return out
+
+    def _borrow_wheel_hotkey(self) -> None:
+        """按着某套轮盘的专属键时，先把盘切过去，再把呼出键借给它。
+
+        顺序不能反：`show_wheel()` 画的是"当前这套盘"，先弹再切会弹出旧的那套。
+        """
+        if self._borrowed_wid or self._down(self._base_hotkey):
+            return                     # 已经在借用，或主热键按着：不抢
+        base = self._base_hotkey
+        for wid, key in self._wheel_hotkey_pairs():
+            if key == base:
+                continue
+            down = self._down(key)
+            was = self._wh_prev.get(key, False)
+            self._wh_prev[key] = down
+            if not (down and not was):
+                continue
+            scfg = self._scfg()
+            if scfg is not None and wid and wid != str(scfg.current or ""):
+                if callable(self.on_switch_wheel):
+                    try:
+                        self.on_switch_wheel(wid)
+                    except Exception as exc:
+                        _log(f"[wheel] 按盘键切到 {wid} 失败: {exc}")
+            self._borrowed_wid = wid
+            self._borrowed_key = key
+            self.hotkey_name = key
+            self.vk = vk_of(key)
+            self._prev = False         # 让状态机认成"刚按下"
+            self._press_at = 0.0
+            self._held_to_wheel = False
+            self._canceled = False
+            return
+
+    def _release_wheel_hotkey(self, force: bool = False) -> None:
+        """借用的键松手了：把呼出键交还主热键。
+
+        只能在**本帧的按下/松手逻辑跑完之后**调 —— 松手那一下（播放选中 / 停止）
+        还得靠借来的 hotkey_name 走完，提前还就等于把这次操作丢了。
+        """
+        if not self._borrowed_wid:
+            return
+        if not force and self._borrowed_key and self._down(self._borrowed_key):
+            return
+        if self._borrowed_key:
+            self._wh_prev[self._borrowed_key] = False
+        self._borrowed_wid = ""
+        self._borrowed_key = ""
+        self.hotkey_name = self._base_hotkey
+        self.vk = vk_of(self.hotkey_name)
+        self._prev = False
+        self._held_to_wheel = False
+        self._canceled = False
 
     def _down(self, name: str) -> bool:
         """这个绑定现在是不是按着。
@@ -4983,11 +5228,6 @@ class InputPoller(QObject):
         actions: list[tuple[str, object]] = []
         seen: set[str] = {norm_spec(self.cfg.get("hotkey", "y"))}
 
-        rk = norm_spec(self.cfg.get("repeat_last_key", ""))
-        if rk and rk not in seen:
-            actions.append((rk, self.audio.play_repeat_last))
-            seen.add(rk)
-
         ck = norm_spec(self.cfg.get("cycle_key", ""))
         if ck and ck not in seen:
             actions.append((ck, self.audio.play_next))
@@ -4997,13 +5237,18 @@ class InputPoller(QObject):
         if sk:
             seen.add(sk)      # 切换轮盘的键不参与"播放音效"绑定，这里只是占位防冲突
 
+        # 每套轮盘的专属呼出键同理：它们要负责弹盘，不能同时又被某个音效占着
+        for _wid, wk in self._wheel_hotkey_pairs():
+            if wk:
+                seen.add(wk)
+
         # 绑定变了，还按着的长按音效就没人管了：先掐掉，免得一直响着停不下来
         self._stop_holds()
 
         by_key: dict[str, list[str]] = {}
         unlock_keys: dict[str, list[str]] = {}
         stop_keys: dict[str, list[str]] = {}
-        scfg = getattr(self.audio.bank, "scfg", None)
+        scfg = self._scfg()
         if scfg is not None:
             # 两个来源合起来：当前轮盘上的绑定 + 勾了「全局通用」的跨轮盘绑定。
             # 同一个键上挂多个音效本来就是允许的（各按自己的触发方式走），
@@ -5061,7 +5306,7 @@ class InputPoller(QObject):
         另一套轮盘，当前轮盘的 items 里没有它，直接查会造出一份默认值，
         音量/变调/长按方式全变默认。
         """
-        scfg = getattr(self.audio.bank, "scfg", None)
+        scfg = self._scfg()
         if scfg is None:
             return SoundSetting()
         try:
@@ -5351,8 +5596,12 @@ class InputPoller(QObject):
             if self.wheel.active:
                 self.wheel.hide_wheel()
                 self._held_to_wheel = True
+            self._release_wheel_hotkey(force=True)
             return
 
+        # 按着某套轮盘的专属键：先把盘切过去，再把呼出键借给它，
+        # 下面这一整套"长按弹盘 / 松手播放 / 单击动作"就都复用了
+        self._borrow_wheel_hotkey()
         down = self._down(self.hotkey_name)
         now = time.monotonic()
 
@@ -5371,12 +5620,22 @@ class InputPoller(QObject):
                 self._held_to_wheel = True
                 idx = self.wheel.commit()
                 if idx is not None:
-                    if DEBUG:
-                        _log(f"[play] {idx}")
-                    self.audio.play(idx)
-                    # 选了音效 = 本来就在干活，顺手退出暂停
-                    if self.user_paused:
-                        self.set_user_pause(False)
+                    if self._preselect():
+                        # 预选模式：只记下选中了哪个，先不出声
+                        if DEBUG:
+                            _log(f"[wheel] 预选 {idx}（等再一次单击才播）")
+                        self._remember_pending(idx)
+                        # 选了东西就是在干活，顺手退出暂停——
+                        # 不然接下来那一下"确认播放"会被暂停挡掉
+                        if self.user_paused:
+                            self.set_user_pause(False)
+                    else:
+                        if DEBUG:
+                            _log(f"[play] {idx}")
+                        self.audio.play(idx)
+                        # 选了音效 = 本来就在干活，顺手退出暂停
+                        if self.user_paused:
+                            self.set_user_pause(False)
                 else:
                     # 指回中空区域松手：先掐掉正在响的声音，再切换暂停状态。
                     # 同一个动作既进也出：暂停中再做一次就是恢复，
@@ -5405,6 +5664,8 @@ class InputPoller(QObject):
             self.wheel.poll_selection()
 
         self._tick_switch()
+        # 松手那一下已经处理完（播放选中 / 停止 / 轻按动作），现在把键还回去
+        self._release_wheel_hotkey()
 
         # 全局一击动作：只在"按下的那一下"触发，按住不会连发
         for key, action in self._actions:
@@ -5524,6 +5785,24 @@ def main() -> int:
         pause_toast.flash(bool(on))
 
     poller.on_pause_changed = on_user_pause
+
+    def on_pending_changed(pending, idx) -> None:
+        """预选模式选中后闪一条提示，否则松手一片安静，像是软件没反应。"""
+        if pending is None:
+            return
+        name = ""
+        try:
+            name = bank.name_at(int(idx)) if idx is not None else ""
+        except Exception:
+            name = ""
+        hint_toast.show_hint(
+            f"已选中「{name}」，再按一次呼出键播放" if name
+            else "已选中，再按一次呼出键播放",
+            "info",
+            1800,
+        )
+
+    poller.on_pending_changed = on_pending_changed
     icon = make_icon()
     app.setWindowIcon(icon)
     tray = QSystemTrayIcon(icon, app)

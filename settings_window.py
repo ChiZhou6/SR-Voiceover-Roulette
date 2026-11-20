@@ -2904,15 +2904,26 @@ class HotkeyPage(QWidget):
 
         self.tap = QComboBox()
         for label, value in (
+            ("播放选中 / 上次那个", "auto"),
             ("什么都不做", "none"),
-            ("重复播放上一个", "repeat_last"),
             ("顺序播放下一个", "next"),
         ):
             self.tap.addItem(label, value)
-        cur = str(cfg.get("tap_action", "none") or "none")
+        cur = str(cfg.get("tap_action", "auto") or "auto")
+        if cur == "repeat_last":
+            cur = "auto"       # 老配置：这个选项并进「播放选中 / 上次那个」了
         idx = self.tap.findData(cur)
         self.tap.setCurrentIndex(max(0, idx))
         l1.addWidget(_row("轻按热键", self.tap, "短按不弹轮盘时执行"))
+
+        self.chk_preselect = QCheckBox("预选模式：长按只选中，再单击才播放")
+        self.chk_preselect.setChecked(bool(cfg.get("preselect_mode", False)))
+        self.chk_preselect.setToolTip(
+            "勾上之后：长按呼出键弹轮盘、划到某一格松手，只是把它「选中」，不出声；\n"
+            "然后再单击一次呼出键（或那套轮盘的专属键）才播放它。\n"
+            "适合边打边挑：先瞄好要放哪个，等真需要的时候再按一下。"
+        )
+        l1.addWidget(self.chk_preselect)
         tip = QLabel(
             "所有按键框都能绑鼠标：点进框里按右键 / 中键 / 侧键即可；"
             "要绑鼠标左键请双击框；滚轮上下、横向滚轮也能绑；点框右侧的 ✕ 取消绑定。\n"
@@ -2926,9 +2937,8 @@ class HotkeyPage(QWidget):
         root.addWidget(card1)
 
         card2, l2 = _card("快捷动作")
-        self.key_repeat = KeyBox(str(cfg.get("repeat_last_key", "") or ""))
-        l2.addWidget(_row("重复上一个", self.key_repeat, "再按一次就再播一次"))
-
+        # v0.9.3：「重复上一个」这一行删掉了 —— 单击呼出轮盘键就是干这个的
+        # （而且是按轮盘分别记的），再留一个独立键只是让人多一处要想的地方。
         self.key_cycle = KeyBox(str(cfg.get("cycle_key", "") or ""))
         l2.addWidget(_row("顺序播放", self.key_cycle, "每按一次播下一个"))
 
@@ -2985,7 +2995,6 @@ class HotkeyPage(QWidget):
         root.addStretch(1)
 
         self.key_wheel.key_changed.connect(lambda _v: self._push())
-        self.key_repeat.key_changed.connect(lambda _v: self._push())
         self.key_cycle.key_changed.connect(lambda _v: self._push())
         self.key_switch.key_changed.connect(lambda _v: self._push())
         self.hold.valueChanged.connect(self._push)
@@ -2997,7 +3006,6 @@ class HotkeyPage(QWidget):
     def _bindings(self) -> list[tuple[str, KeyBox]]:
         return [
             ("呼出轮盘", self.key_wheel),
-            ("重复上一个", self.key_repeat),
             ("顺序播放", self.key_cycle),
             ("切换轮盘", self.key_switch),
         ]
@@ -3006,7 +3014,7 @@ class HotkeyPage(QWidget):
         """把"这个键已经被别人占了"显示出来。
 
         轮询器遇到重复绑定时会跳过后者，用户不知道就以为功能坏了
-        （真实案例：重复上一个和呼出轮盘都绑成了 Y，按 Y 什么都不发生）。
+        （真实案例：顺序播放和呼出轮盘都绑成了 Y，按 Y 什么都不发生）。
 
         v0.9 起**音效之间共用一个键是正常用法**：像"长按左键播 AAA、
         松手左键播 B"本来就该挂在同一个键上，各自按自己的触发方式走。
@@ -3107,10 +3115,10 @@ class HotkeyPage(QWidget):
             self.key_wheel.set_key(str(self.cfg.get("hotkey", "y") or "y"))
         self.cfg["hotkey"] = self.key_wheel.key_name or "y"
         self.cfg["hold_ms"] = int(self.hold.value())
-        self.cfg["repeat_last_key"] = self.key_repeat.key_name
         self.cfg["cycle_key"] = self.key_cycle.key_name
         self.cfg["switch_key"] = self.key_switch.key_name
-        self.cfg["tap_action"] = str(self.tap.currentData() or "none")
+        self.cfg["tap_action"] = str(self.tap.currentData() or "auto")
+        self.cfg["preselect_mode"] = bool(self.chk_preselect.isChecked())
         self.cfg["open_settings_on_start"] = bool(self.chk_autosettings.isChecked())
         self.refresh_conflicts()
         self.changed.emit()
@@ -3191,6 +3199,24 @@ class WheelPage(QWidget):
         lay.addWidget(self.chk_anim)
 
         root.addWidget(card)
+
+        # ---------------- 停止与淡出 ----------------
+        card_f, lay_f = _card("停止与淡出")
+        self.chk_stop_fade = QCheckBox("停止 / 暂停时让声音慢慢淡出")
+        self.chk_stop_fade.setChecked(bool(cfg.get("stop_fade_enabled", False)))
+        self.chk_stop_fade.setToolTip(
+            "关：停止就是把声音收掉，只留 12 毫秒的防爆音过渡（听不出来）。\n"
+            "开：按下面的时长把音量一路降到底，像余音散掉。\n"
+            "影响的是「整盘停止」——轮盘中心松手暂停、托盘里的停止。\n"
+            "条件停止键和连击打断仍然是快速掐掉，不然连击会糊成一片。"
+        )
+        lay_f.addWidget(self.chk_stop_fade)
+        self.stop_fade = self._slider(int(cfg.get("stop_fade_ms", 400)), 60, 2000, " ms")
+        self.stop_fade.setToolTip("淡出要花多久：60ms 像轻轻一收，2 秒是很长的拖尾")
+        lay_f.addWidget(_row("淡出时长", self.stop_fade, "越长余音拖得越久"))
+        self.chk_stop_fade.toggled.connect(self._sync_stop_fade_enabled)
+        root.addWidget(card_f)
+        self._sync_stop_fade_enabled(self.chk_stop_fade.isChecked())
 
         # ---------------- 配色：主题色（界面）+ 轮盘色（每套各自一个） ----------------
         card_p, lay_p = _card("配色")
@@ -3277,6 +3303,25 @@ class WheelPage(QWidget):
             wbtns.addWidget(b)
         wbtns.addStretch(1)
         lay_w.addLayout(wbtns)
+
+        # 这套轮盘自己的呼出键：长按切过去并弹盘，单击放这套盘上次响的那个
+        wr = QHBoxLayout()
+        wr.setSpacing(8)
+        lb_hk = QLabel("呼出键")
+        lb_hk.setStyleSheet("font-size:12px;")
+        wr.addWidget(lb_hk)
+        self.key_wheel = KeyBox("", 132)
+        self.key_wheel.setToolTip(
+            "长按这个键：切到这套轮盘，并把轮盘弹出来\n"
+            "单击这个键：放这套轮盘上次响过的那个音效（一次都没放过就放第一格）\n"
+            "留空 = 只能用主热键、或者「切换轮盘的轮盘」进来"
+        )
+        wr.addWidget(self.key_wheel)
+        hint_wk = QLabel("长按切到这套并弹盘，单击放上次那个")
+        hint_wk.setObjectName("Hint")
+        wr.addWidget(hint_wk, 1)
+        lay_w.addLayout(wr)
+        self.key_wheel.key_changed.connect(self._on_wheel_hotkey)
         root.addWidget(card_w)
 
         card2, lay2 = _card("手感")
@@ -3411,7 +3456,11 @@ class WheelPage(QWidget):
         cur = self.scfg.current
         for w in self.scfg.wheels:
             mark = "● 正在用   " if w.wid == cur else "○ "
-            item = QListWidgetItem(f"{mark}{w.name or w.wid}    {len(w.order)} 个音效")
+            hk = str(getattr(w, "hotkey", "") or "")
+            tail = f"    {sr.spec_label(hk)}" if hk else ""
+            item = QListWidgetItem(
+                f"{mark}{w.name or w.wid}    {len(w.order)} 个音效{tail}"
+            )
             item.setData(Qt.UserRole, w.wid)
             # 名字染成这套轮盘的颜色，方便一眼对上；但不能直接拿原色去染——
             # 用户挑了个深蓝/深紫时，文字在深色列表里就糊成一片看不见了。
@@ -3446,6 +3495,68 @@ class WheelPage(QWidget):
         self.btn_w_rename.setEnabled(bool(wid))
         self.btn_w_clear.setEnabled(bool(wid))
         self.btn_w_del.setEnabled(total > 1 and bool(wid))
+        self._load_wheel_hotkey()
+
+    # ---- 每套轮盘的专属呼出键 ----
+    def _load_wheel_hotkey(self) -> None:
+        """把选中那套轮盘的呼出键显示到输入框里（只显示，不回写）。"""
+        wid = self._sel_wid()
+        w = None
+        if self.scfg is not None and wid:
+            try:
+                w = self.scfg.wheel_by_id(wid)
+            except Exception:
+                w = None
+        box = getattr(self, "key_wheel", None)
+        if box is None:
+            return
+        box.blockSignals(True)
+        box.set_key(str(getattr(w, "hotkey", "") or ""))
+        box.blockSignals(False)
+        box.setEnabled(w is not None)
+
+    def _on_wheel_hotkey(self, key: str) -> None:
+        """写回这套轮盘的呼出键，顺带查重。
+
+        两套盘绑同一个键等于没绑（永远只会切到第一套），主热键同理——
+        所以撞了就明确拒绝，而不是默默接受然后在游戏里表现成"按了没反应"。
+        """
+        wid = self._sel_wid()
+        if self.scfg is None or not wid:
+            return
+        key = str(key or "").strip()
+        w = None
+        try:
+            w = self.scfg.wheel_by_id(wid)
+        except Exception:
+            w = None
+        if w is None:
+            return
+
+        if key:
+            base = sr.norm_spec(str(self.cfg.get("hotkey") or "y"))
+            if key == base:
+                QMessageBox.information(
+                    self, "呼出键",
+                    f"「{sr.spec_label(key)}」已经是主呼出键了，换一个。"
+                )
+                self._load_wheel_hotkey()
+                return
+            for other in self.scfg.wheels:
+                if other.wid == wid:
+                    continue
+                if sr.norm_spec(getattr(other, "hotkey", "") or "") == key:
+                    QMessageBox.information(
+                        self, "呼出键",
+                        f"「{sr.spec_label(key)}」已经给「{other.name or other.wid}」用了，换一个。"
+                    )
+                    self._load_wheel_hotkey()
+                    return
+
+        w.hotkey = key
+        scfg_save(self.scfg)
+        self.refresh_wheels()
+        self.changed.emit()      # 主程序据此重绑键
 
     def _do_switch(self) -> None:
         wid = self._sel_wid()
@@ -3526,6 +3637,16 @@ class WheelPage(QWidget):
             self.refresh_wheels()
             self.changed.emit()
 
+    def _sync_stop_fade_enabled(self, on: bool) -> None:
+        """没开淡出时把时长滑块灰掉。
+
+        藏起来反而让人找不到；灰着能说明"开了才有得调"。
+        """
+        try:
+            self.stop_fade.setEnabled(bool(on))
+        except Exception:
+            pass
+
     def _push(self) -> None:
         self.cfg["wheel_radius"] = int(self.radius.slider.value())
         self.cfg["inner_ratio"] = self.inner.slider.value() / 100.0
@@ -3534,6 +3655,8 @@ class WheelPage(QWidget):
         self.cfg["outer_thickness"] = int(self.outer_thick.slider.value())
         self.cfg["show_names"] = bool(self.chk_names.isChecked())
         self.cfg["animations"] = bool(self.chk_anim.isChecked())
+        self.cfg["stop_fade_enabled"] = bool(self.chk_stop_fade.isChecked())
+        self.cfg["stop_fade_ms"] = int(self.stop_fade.slider.value())
         self.cfg["sensitivity"] = self.sensitivity.slider.value() / 100.0
         self.cfg["noise_floor"] = int(self.noise.slider.value())
         self.changed.emit()
@@ -3774,6 +3897,13 @@ class MicPage(QWidget):
             lines.append(f"送声：{cable}")
         if st.get("error"):
             lines.append(f"⚠ {st['error']}")
+            # 采集失败时给能照着做的三步：只甩一句"打不开"，用户除了重装什么也做不了
+            lines.append(
+                "  常见原因按顺序查：① 设置→隐私和安全性→麦克风，确认"
+                "「允许桌面应用访问麦克风」是开的；② 把要用的麦克风设成系统默认输入；"
+                "③ 关掉正在占用麦克风的软件（直播/会议/语音助手），再点「开始测试」。"
+            )
+            lines.append("  还是不行就把程序目录里的 sr_roulette.log 发给作者。")
         if st.get("cable_error"):
             lines.append(f"⚠ {st['cable_error']}")
         if not self.chk_enable.isChecked():
@@ -4065,7 +4195,11 @@ class HelpPage(QWidget):
                 "暂停期间轮盘键和「切换轮盘」的键都照常能用（它们不发声，不算破例），"
                 "换一套轮盘之后仍然是暂停状态，不会把暂停顺手解掉。\n"
                 "轮盘弹着时点鼠标左键 / 右键：立刻收起，什么都不播，这一按也不会再弹。\n"
-                "单击 Y：直接重播上一个，不开轮盘。",
+                "单击 Y（不开轮盘）：直接放这套轮盘上次响过的那个，一次都没放过就放第一格。\n"
+                "勾上「预选模式」之后改成两步：长按弹盘、划到某格松手只是「选中」（屏幕上会闪一下名字），"
+                "再单击一次呼出键才真的放出来——适合先瞄好、等真需要时再按。\n"
+                "中空松手那一下如果觉得「啪」地切断太生硬，「轮盘」页最下面有「停止与淡出」，"
+                "开启后按设定时长慢慢收尾（条件停止键和连击打断仍然是快速掐掉，不然连击会糊）。",
             ),
             (
                 "5｜调每个音效",
@@ -4085,6 +4219,15 @@ class HelpPage(QWidget):
                 "正在响的音效不会被打断。\n"
                 "选择器里一圈都是轮盘名，鼠标指到哪一格，"
                 "那一整块就亮成它自己的颜色，中间的名字和鼠标点也跟着变色，",
+            ),
+            (
+                "6b｜每套轮盘绑自己的键",
+                "「轮盘」页「轮盘库」下面有个「呼出键」框：选中哪套就改哪套的键。\n"
+                "长按它：直接切到这套并弹出轮盘（不用先按「切换轮盘」）；"
+                "单击它：放这套盘上次响过的那个音效。\n"
+                "八套盘可以各绑一个键，边打边换盘全靠单手。留空就是只能用主热键进来。\n"
+                "绑之前会查重：跟主呼出键、或跟别的盘撞了会直接拒绝并说明撞的是谁——"
+                "两套盘绑同一个键等于永远只切到第一套。",
             ),
             (
                 "7｜配色（应用主题色 / 轮盘颜色是两回事）",
@@ -4251,7 +4394,7 @@ class HelpPage(QWidget):
             "· 组合音效也有这一项。组合的定义是所有轮盘共用的，但它绑的那个键"
             "在别的轮盘上还算不算数，仍然单独决定 —— 勾上之后，在别的轮盘按它"
             "也能把这条组合放出来。\n"
-            "· 如果这个键同时被「呼出轮盘」「重复上一个」这类全局键占着，"
+            "· 如果这个键同时被「呼出轮盘」「顺序播放」这类全局键占着，"
             "音效仍然会让路（按下不响），「快捷键」页顶部会标出来。"
         )
 
@@ -4402,7 +4545,7 @@ class HelpPage(QWidget):
                 "先看那个音效「条件」里是不是选了「条件解锁」——选了就得先按一下解锁键。\n"
                 "再看「触发」：设成「松手触发」时，按下本来就不该响，得松手才响；"
                 "设成「长按触发」时，松手就停，声音会很短。\n"
-                "最后看「快捷键」页顶部的提示：如果这个键同时也是呼出轮盘 / 重复上一个 /"
+                "最后看「快捷键」页顶部的提示：如果这个键同时也是呼出轮盘 / 顺序播放 /"
                 "顺序播放 / 切换轮盘，全局键优先，挂在它上面的音效会被让路，换个键就好。\n"
                 "另外轮盘弹出的时候按鼠标左键/右键是「取消呼出」，那一下也不会播音效。",
             ),

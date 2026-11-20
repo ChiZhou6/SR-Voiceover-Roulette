@@ -263,6 +263,7 @@ class _EngineStub:
     """AudioEngine 也是 QObject 子类，同样借方法挂到普通类上。"""
 
     play = sr.AudioEngine.play
+    _remember_last = sr.AudioEngine._remember_last
 
 
 def make_engine(stop_prev, entry=None):

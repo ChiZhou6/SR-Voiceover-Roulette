@@ -157,8 +157,8 @@ def main() -> int:
     run(60)
     check(state["n"] == 1, "长按不额外触发轻按动作", f"播放 {state['n']} 次")
 
-    print("\n=== 6. 默认配置就是「长按弹轮盘 / 单击重复」 ===")
-    check(sr.DEFAULT_CONFIG["tap_action"] == "repeat_last", "默认 tap_action",
+    print("\n=== 6. 默认配置就是「长按弹轮盘 / 单击播放选中或上次那个」 ===")
+    check(sr.DEFAULT_CONFIG["tap_action"] == "auto", "默认 tap_action",
           sr.DEFAULT_CONFIG["tap_action"])
     check(sr.DEFAULT_CONFIG["hotkey"] == "y", "默认呼出键 Y")
 

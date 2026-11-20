@@ -255,6 +255,9 @@ class WheelDef:
     wid: str
     name: str = ""
     color: str = ""                       # "#rrggbb"；空字符串 = 跟随主题色
+    # 这套轮盘自己的呼出键（v0.9.3）。空 = 只能用主热键 + 切换键进去。
+    # 长按它 = 切到这套盘并弹出轮盘；单击它 = 放这套盘上次响过的那个音效。
+    hotkey: str = ""
     order: list[str] = field(default_factory=list)
     outer_slots: list[str | None] = field(default_factory=_blank_slots)
     items: dict[str, SoundSetting] = field(default_factory=dict)
@@ -274,6 +277,7 @@ class WheelDef:
             "wid": self.wid,
             "name": self.name,
             "color": self.color,
+            "hotkey": self.hotkey,
             "order": self.order,
             "outer_slots": self.outer_slots,
             "items": {k: asdict(v) for k, v in self.items.items()},
@@ -285,6 +289,7 @@ class WheelDef:
             wid=wid,
             name=name,
             color=self.color,
+            hotkey="",       # 呼出键不跟着复制：两套盘绑同一个键没法用
             order=list(self.order),
             outer_slots=list(self.outer_slots),
             items={k: SoundSetting(**asdict(v)) for k, v in self.items.items()},
@@ -622,6 +627,7 @@ class SoundsConfig:
                     wid=str(raw.get("wid")),
                     name=str(raw.get("name") or ""),
                     color=str(raw.get("color") or ""),
+                    hotkey=str(raw.get("hotkey") or ""),
                     order=list(raw.get("order") or []),
                     outer_slots=list(raw.get("outer_slots") or []),
                     items=read_items(raw.get("items")),

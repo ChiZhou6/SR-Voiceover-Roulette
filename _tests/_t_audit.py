@@ -200,13 +200,12 @@ def main() -> int:
     app.processEvents()
     check(disk().get("hold_ms") == 320, "长按时长写入", str(disk().get("hold_ms")))
 
-    hk.key_repeat.set_key("r")
-    hk.key_repeat.key_changed.emit("r")
-    app.processEvents()
-    check(cfg.get("repeat_last_key") == "r", "重复上一个键写入", str(cfg.get("repeat_last_key")))
+    # v0.9.3：独立的「重复上一个」按键删掉了，改由单击呼出键承担
+    check(not hasattr(hk, "key_repeat"), "「重复上一个」绑定行已删除")
     fns = [a for _vk, a in poller._actions]
-    check(any(getattr(a, "__name__", "") == "play_repeat_last" for a in fns),
-          "轮询器绑上重复上一个", str([getattr(a, '__name__', '?') for a in fns]))
+    check(not any(getattr(a, "__name__", "") == "play_repeat_last" for a in fns),
+          "轮询器不再绑独立的「重复上一个」",
+          str([getattr(a, "__name__", "?") for a in fns]))
 
     hk.key_cycle.set_key("t")
     hk.key_cycle.key_changed.emit("t")
@@ -220,8 +219,6 @@ def main() -> int:
     win2 = SettingsWindow(cfg, scfg, bank)
     app.processEvents()
     check(win2.page_key.key_wheel.text().lower() == "g", "重开后呼出键回显", win2.page_key.key_wheel.text())
-    check(win2.page_key.key_repeat.text().lower() == "r",
-          "重开后重复上一个键回显", repr(win2.page_key.key_repeat.text()))
     check(win2.page_key.key_cycle.text().lower() == "t",
           "重开后顺序播放键回显", repr(win2.page_key.key_cycle.text()))
     win2.hide()
@@ -267,7 +264,9 @@ def main() -> int:
     check(scfg.setting(name).hotkey == "v", "单音效快捷键写入", str(scfg.setting(name).hotkey))
     check("v" in (scfg.hotkey_map() or {}), "进了 hotkey_map", str(scfg.hotkey_map()))
     check("v" in poller._by_key, "音效快捷键进了绑定表", str(poller._by_key))
-    check(len(poller._actions) >= 2, "两个全局动作都还绑着", str(len(poller._actions)))
+    # v0.9.3：全局动作只剩「顺序播放」一个（「重复上一个」并进单击呼出键了）
+    check(len(poller._actions) >= 1, "顺序播放仍然绑着",
+          str([getattr(a, "__name__", "?") for _k, a in poller._actions]))
 
     det.btn_play.click()
     app.processEvents()
