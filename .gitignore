@@ -1,6 +1,8 @@
 # ---- 运行期生成（每台机器都不一样，不进仓库） ----
 config.json
 sounds.json
+sounds.json.bak
+sounds.json.tmp
 sr_roulette.log
 *.log
 
