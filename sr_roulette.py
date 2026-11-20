@@ -4940,6 +4940,11 @@ class InputPoller(QObject):
         self._sw_at = 0.0
         # 用户选中了另一套轮盘时调这里（由主程序接上"真的去切"）
         self.on_switch_wheel: object = None
+        # 按下某套盘的专属键时调这里：`fn(wid)` = 临时把那一套摆上台面，
+        # `fn("")` = 松手了，还原成原来的那套。**这不是"切盘"**——
+        # 当前轮盘（主热键呼出的那套）必须保持不变，否则按一次 B 的键，
+        # 主热键以后就只出 B 了，用户想回 A 还得再手动切回来。
+        self.on_preview_wheel: object = None
         self.hotkey_name = norm_spec(cfg["hotkey"]) or "y"
         self.vk = vk_of(self.hotkey_name)
         # ---- 每套轮盘的专属呼出键（v0.9.3）----
@@ -4949,6 +4954,7 @@ class InputPoller(QObject):
         self._base_hotkey = self.hotkey_name
         self._borrowed_wid = ""      # 正在借用的轮盘 id（空 = 没借）
         self._borrowed_key = ""      # 正在借用的那个键
+        self._previewed_wid = ""     # 已经让主程序临时摆上台面的轮盘 id
         self._wh_prev: dict[str, bool] = {}   # 盘键上一帧是否按着
         self._prev = False
         self._press_at = 0.0
@@ -5111,6 +5117,8 @@ class InputPoller(QObject):
 
     def set_hotkey(self, name: str) -> None:
         """换呼出键。键盘、鼠标、组合键都支持。"""
+        # 换键前先把临时摆出来的那套收回去，否则它会一直顶在台面上
+        self._restore_wheel()
         self.hotkey_name = norm_spec(name) or "y"
         self.vk = vk_of(self.hotkey_name)
         # 主热键换了：借用状态一起作废，免得还指着一个已经不存在的键
@@ -5143,9 +5151,14 @@ class InputPoller(QObject):
         return out
 
     def _borrow_wheel_hotkey(self) -> None:
-        """按着某套轮盘的专属键时，先把盘切过去，再把呼出键借给它。
+        """按着某套轮盘的专属键时，先把那一套临时摆上台面，再把呼出键借给它。
 
-        顺序不能反：`show_wheel()` 画的是"当前这套盘"，先弹再切会弹出旧的那套。
+        顺序不能反：`show_wheel()` 画的是"当前这套盘"，先弹再换会弹出旧的那套。
+
+        **只临时换、不真的切盘**：这一下结束后（松手 / 取消）由
+        `_release_wheel_hotkey()` 调 `on_preview_wheel("")` 还原。
+        以前这里调的是 `on_switch_wheel`，效果是永久切过去 ——
+        按一次 B 的键，主热键以后就只出 B 了。
         """
         if self._borrowed_wid or self._down(self._base_hotkey):
             return                     # 已经在借用，或主热键按着：不抢
@@ -5158,13 +5171,7 @@ class InputPoller(QObject):
             self._wh_prev[key] = down
             if not (down and not was):
                 continue
-            scfg = self._scfg()
-            if scfg is not None and wid and wid != str(scfg.current or ""):
-                if callable(self.on_switch_wheel):
-                    try:
-                        self.on_switch_wheel(wid)
-                    except Exception as exc:
-                        _log(f"[wheel] 按盘键切到 {wid} 失败: {exc}")
+            self._show_wheel_temporarily(wid)
             self._borrowed_wid = wid
             self._borrowed_key = key
             self.hotkey_name = key
@@ -5175,8 +5182,43 @@ class InputPoller(QObject):
             self._canceled = False
             return
 
+    def _show_wheel_temporarily(self, wid: str) -> None:
+        """把某套盘临时摆上台面（不动"当前轮盘"）。
+
+        主程序没接 `on_preview_wheel` 时退回老的 `on_switch_wheel`：
+        宁可临时变成"真切"，也不能让用户按了盘键弹出另一套盘的音效。
+        """
+        scfg = self._scfg()
+        if scfg is None or not wid or wid == str(scfg.current or ""):
+            return
+        if callable(self.on_preview_wheel):
+            try:
+                self.on_preview_wheel(wid)
+                self._previewed_wid = wid
+            except Exception as exc:
+                _log(f"[wheel] 临时摆出 {wid} 失败: {exc}")
+            return
+        if callable(self.on_switch_wheel):
+            try:
+                self.on_switch_wheel(wid)
+            except Exception as exc:
+                _log(f"[wheel] 按盘键切到 {wid} 失败: {exc}")
+
+    def _restore_wheel(self) -> None:
+        """把临时摆上台面的那套收回去（还原成用户的"当前轮盘"）。"""
+        if not self._previewed_wid:
+            return
+        self._previewed_wid = ""
+        fn = self.on_preview_wheel
+        if not callable(fn):
+            return
+        try:
+            fn("")
+        except Exception as exc:
+            _log(f"[wheel] 还原当前轮盘失败: {exc}")
+
     def _release_wheel_hotkey(self, force: bool = False) -> None:
-        """借用的键松手了：把呼出键交还主热键。
+        """借用的键松手了：把呼出键交还主热键，临时摆出的盘也收回去。
 
         只能在**本帧的按下/松手逻辑跑完之后**调 —— 松手那一下（播放选中 / 停止）
         还得靠借来的 hotkey_name 走完，提前还就等于把这次操作丢了。
@@ -5194,6 +5236,7 @@ class InputPoller(QObject):
         self._prev = False
         self._held_to_wheel = False
         self._canceled = False
+        self._restore_wheel()
 
     def _down(self, name: str) -> bool:
         """这个绑定现在是不是按着。
@@ -5853,15 +5896,23 @@ def main() -> int:
     menu = QMenu()
 
     _settings_holder: dict[str, object] = {"win": None}
+    # 按专属键临时摆出某套盘时，记着"原来那套"是哪套，松手好还原。
+    # 永久切换（switch_wheel）会把它清空，免得松手时把用户刚切过去的盘又顶回去。
+    _preview_back: dict[str, str] = {"wid": ""}
 
     def switch_wheel(wid: str) -> None:
-        """切到另一套轮盘：换布局、换参数、换颜色，正在响的音效不会被打断。"""
+        """切到另一套轮盘：换布局、换参数、换颜色，正在响的音效不会被打断。
+
+        这是**真的切**：写盘、下次启动还是这套。只有"切换轮盘的键"
+        和设置窗口里手动点切换才走这里。
+        """
         target = scfg.wheel_by_id(wid)
         if target is None or wid == scfg.current:
             return
         name = target.name or wid
         if not scfg.switch_wheel(wid):
             return
+        _preview_back["wid"] = ""      # 这是永久的：别再还原回去了
         scfg.save()
         bank.reload()
         audio.load(stop_playing=False)
@@ -5874,6 +5925,47 @@ def main() -> int:
         hint_toast.show_hint(f"已切换到「{name}」")
 
     poller.on_switch_wheel = switch_wheel
+
+    # ---- 按某套盘的专属键：临时把它摆上台面，松手还原 ----
+    # 之所以不直接调 switch_wheel：那个是永久的。按一次 B 的键就把
+    # "当前轮盘"改成 B，主热键以后就只出 B 了 —— 这不是用户要的。
+
+    def preview_wheel(wid: str) -> None:
+        """`wid` 非空 = 临时摆出这一套；空 = 松手了，还原成原来的那套。"""
+        back = _preview_back.get("wid", "")
+        if not wid:
+            _preview_back["wid"] = ""
+            if not back or back == scfg.current:
+                return
+            if not scfg.switch_wheel(back):
+                return
+            bank.reload()
+            audio.load(stop_playing=False)
+            wheel.refresh_theme()
+            poller.rebuild_bindings()
+            act_count.setText(f"已加载音效：{len(audio)} 个（上限 {MAX_SLOTS}）")
+            if DEBUG:
+                _log(f"[wheel] 收回临时盘，回到 {back}")
+            return
+
+        if wid == scfg.current:
+            _preview_back["wid"] = ""     # 本来就是这套，松手没什么可还原的
+            return
+        if scfg.wheel_by_id(wid) is None:
+            return
+        if not back:
+            _preview_back["wid"] = str(scfg.current or "")
+        if not scfg.switch_wheel(wid):
+            return
+        bank.reload()                     # 只换内存里的"当前"，不写盘
+        audio.load(stop_playing=False)
+        wheel.refresh_theme()
+        poller.rebuild_bindings()
+        act_count.setText(f"已加载音效：{len(audio)} 个（上限 {MAX_SLOTS}）")
+        if DEBUG:
+            _log(f"[wheel] 临时摆出 {wid}（当前轮盘仍是 {back}）")
+
+    poller.on_preview_wheel = preview_wheel
 
     def open_settings() -> None:
         # 延迟导入：settings_window 反过来要 import 本模块，顶层导入会循环
