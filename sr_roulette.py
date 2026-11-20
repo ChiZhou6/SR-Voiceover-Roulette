@@ -2161,12 +2161,29 @@ class Mixer(QIODevice):
         if group and max_voices > 0:
             self._retire_oldest(group, max_voices)
         # 同一音效连按两次时叠加播放，不做打断，免得出现截断的尾巴
-        # [波形, 播放位置, 音量, 淡出剩余帧, 延迟剩余帧, 分组, 触发编号, 槽位]
+        # [波形, 播放位置, 音量, 淡出剩余帧, 延迟剩余帧, 分组, 触发编号, 槽位, 淡出总帧数]
+        # 最后一个（第 9 位）只有正在淡出时才有意义，见 readData 里的 ramp 计算。
         self.voices.append(
             [clip, 0, float(gain), 0, max(0, int(delay)), group,
              int(token), int(slot)]
         )
         return True
+
+    @staticmethod
+    def _begin_fade(voice: list, frames: int) -> None:
+        """给一路声音挂上淡出：记剩余帧数，也记总帧数。
+
+        总帧数是画斜坡用的分母。只记"剩余"的话，每个音频块都会从
+        「剩余/剩余 = 1.0」重新开始算，等于把淡出切成一段段往回弹的
+        小锯齿 —— 12ms 的防爆音淡出比一个块还短，看不出问题；一旦
+        用户把淡出调到几百毫秒，就会听见"嗡嗡"的颤音。
+        """
+        frames = max(1, int(frames))
+        voice[3] = frames
+        if len(voice) > 8:
+            voice[8] = frames
+        else:
+            voice.append(frames)
 
     def _stop_voices(self, hit, fade_ms: float = 12.0) -> int:
         """按条件掐掉一批声部，返回真正处理掉的条数。
@@ -2187,7 +2204,7 @@ class Mixer(QIODevice):
                 continue          # 还没开口：直接摘掉，不用淡出
             if fade <= 0:
                 continue          # 立刻切（调用方自己承担爆音）
-            voice[3] = max(1, fade)
+            self._begin_fade(voice, fade)
             kept.append(voice)
         self.voices = kept
         return n
@@ -2238,7 +2255,7 @@ class Mixer(QIODevice):
             if len(voice) > 4 and voice[4] > 0:
                 del self.voices[k]            # 还没响：直接摘掉，不用淡出
                 continue
-            voice[3] = max(1, int(self.rate * 0.012))   # 正在响：12ms 淡出
+            self._begin_fade(voice, int(self.rate * 0.012))   # 正在响：12ms 淡出
 
     def stop_all(self, fade_ms: float = 12.0) -> None:
         """停止所有正在播放的声音。
@@ -2258,7 +2275,7 @@ class Mixer(QIODevice):
         for voice in self.voices:
             if len(voice) > 4 and voice[4] > 0:
                 continue          # 还没开始响：直接不留
-            voice[3] = fade
+            self._begin_fade(voice, fade)
             kept.append(voice)
         self.voices = kept
 
@@ -2299,8 +2316,10 @@ class Mixer(QIODevice):
                 if gain != 1.0:
                     seg = seg * gain
                 if fade > 0:
-                    # (fade-1)/fade … 0/fade：收到 0 时正好静音，不会留在半途
-                    ramp = (fade - np.arange(n, dtype=np.float32)) / float(fade)
+                    # 分母是**淡出总帧数**，不是本块剩下的帧数 —— 否则每块
+                    # 都从 1.0 重新往下滑，听起来是一串"嗡嗡"的锯齿。
+                    total = voice[8] if len(voice) > 8 and voice[8] > 0 else fade
+                    ramp = (fade - np.arange(n, dtype=np.float32)) / float(total)
                     seg = seg * ramp[:, None]
                     voice[3] = fade - n
                 out[off:off + n] += seg
@@ -2907,9 +2926,10 @@ class AudioEngine(QObject):
 
         st = self._setting_of_slot(idx)
         # 连击时停掉上一个：先把这一格上一声还没放完的掐掉，再开口。
-        # 默认不掐（叠加），勾了才走这里。
+        # 默认不掐（叠加），勾了才走这里。守住 12ms —— 这不是"停止"，
+        # 是给下一声腾地方，淡太长会和新的叠成一片糊音。
         if st is not None and getattr(st, "stop_prev", False):
-            self.stop_slot(idx)
+            self.stop_slot(idx, 12.0)
 
         # 组合条目：不走普通音效那套连击变调，直接进组合排程
         entry = self.bank.entry_at(idx)
@@ -3411,14 +3431,22 @@ class AudioEngine(QObject):
         默认是 12ms 的"防爆音淡出"——人耳听不出来，只是不让扬声器蹦出咔嚓声。
         开了「停止淡出」之后按用户设的时长慢慢收尾，听起来是余音散掉，不是硬切。
         """
-        fade = 12.0
-        if bool(self.cfg.get("stop_fade_enabled", False)):
-            try:
-                fade = max(0.0, min(5000.0, float(self.cfg.get("stop_fade_ms", 400))))
-            except Exception:
-                fade = 400.0
+        fade = self._stop_fade_ms()
         for mix in self._mixers_all():
             mix.stop_all(fade)
+
+    def _stop_fade_ms(self) -> float:
+        """停止时该淡多久（毫秒）。
+
+        只有「停止 / 暂停」这一路要听用户的；换设备重建链路那种属于
+        内部动作，直接硬切，慢慢淡会把旧设备的声音拖着送进新设备。
+        """
+        if bool(self.cfg.get("stop_fade_enabled", False)):
+            try:
+                return max(0.0, min(5000.0, float(self.cfg.get("stop_fade_ms", 400))))
+            except Exception:
+                return 400.0
+        return 12.0
 
     # ---- 按次停止（v0.9：长按触发松手就停）----
     def new_token(self) -> int:
@@ -3430,21 +3458,25 @@ class AudioEngine(QObject):
         """停掉某一次触发放出去的全部声音。token=0 什么也不做。"""
         if not token:
             return
+        fade = self._stop_fade_ms()
         for mix in self._mixers_all():
-            mix.stop_token(token)
+            mix.stop_token(token, fade)
 
-    def stop_slot(self, idx: int, fade_ms: float = 12.0) -> int:
+    def stop_slot(self, idx: int, fade_ms: float | None = None) -> int:
         """掐掉某个槽位放出来的全部声部。两个出口都掐。
 
-        「连击时停掉上一个」和条件停止键都走这里：声音是按槽位认的，
+        「条件停止键」和「连击时停掉上一个」都走这里：声音是按槽位认的，
         不管它是快捷键按的、轮盘点响的，还是长按连发出来的。
+        fade_ms 默认跟着「停止淡出」的设置走；连击打断会显式传 12ms ——
+        那是"腾地方给下一声"，淡太久会糊成一片。
         """
+        fade = self._stop_fade_ms() if fade_ms is None else float(fade_ms)
         n = 0
         for mix in self._mixers_all():
-            n += mix.stop_slot(idx, fade_ms)
+            n += mix.stop_slot(idx, fade)
         return n
 
-    def stop_named(self, name: str, fade_ms: float = 12.0) -> int:
+    def stop_named(self, name: str, fade_ms: float | None = None) -> int:
         """掐掉某个音效**此刻**正在响的全部声音（条件停止键用）。
 
         和 stop_token 的分工：token 认得是"哪一次触发"，所以长按松手用它；
@@ -5222,8 +5254,9 @@ class InputPoller(QObject):
 
         v0.9 起一个键可以挂**多个**音效：像"长按左键播 AAA、松手左键播 B"
         这种玩法本来就是两个音效共用一个键，各自按自己的触发方式响应。
-        四个"全局键"（呼出轮盘 / 重复上一个 / 顺序播放 / 切换轮盘）仍然
-        优先，被它们占了的键不再给音效用，免得一按又弹轮盘又出声。
+        全局键（呼出轮盘 / 顺序播放 / 切换轮盘，外加每套轮盘自己的呼出键）
+        仍然优先，被它们占了的键不再给音效用，免得一按又弹轮盘又出声。
+        （v0.9.3 起「重复上一个」那个独立键删了：轻点呼出键就是干这个的。）
         """
         actions: list[tuple[str, object]] = []
         seen: set[str] = {norm_spec(self.cfg.get("hotkey", "y"))}

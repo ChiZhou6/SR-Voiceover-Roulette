@@ -3207,8 +3207,8 @@ class WheelPage(QWidget):
         self.chk_stop_fade.setToolTip(
             "关：停止就是把声音收掉，只留 12 毫秒的防爆音过渡（听不出来）。\n"
             "开：按下面的时长把音量一路降到底，像余音散掉。\n"
-            "影响的是「整盘停止」——轮盘中心松手暂停、托盘里的停止。\n"
-            "条件停止键和连击打断仍然是快速掐掉，不然连击会糊成一片。"
+            "影响所有\"停\"：轮盘中心松手、托盘停止、条件停止键、长按松手。\n"
+            "只有「连击时停掉上一次」不动——那一下是给新的一声腾地方，淡久了会糊。"
         )
         lay_f.addWidget(self.chk_stop_fade)
         self.stop_fade = self._slider(int(cfg.get("stop_fade_ms", 400)), 60, 2000, " ms")
@@ -3341,10 +3341,13 @@ class WheelPage(QWidget):
         root.addStretch(1)
 
         for w in (self.radius, self.inner, self.scale, self.opacity, self.outer_thick,
-                  self.sensitivity, self.noise):
+                  self.sensitivity, self.noise, self.stop_fade):
             w.slider.valueChanged.connect(self._push)
         self.chk_names.toggled.connect(self._push)
         self.chk_anim.toggled.connect(self._push)
+        # 勾选框和滑块都要接上：只接 toggled（灰化）不接 _push 的话，
+        # 用户勾了「停止淡出」但配置里一直是 False，声音照旧被一刀切断。
+        self.chk_stop_fade.toggled.connect(self._push)
 
         self.refresh_wheels()
         self._refresh_color_dots()
